@@ -40,6 +40,16 @@ class Settings(BaseSettings):
         env="LIMIT_ORDER_TIMEOUT_SECONDS",
         description="限价单超时时间（秒）。如果限价单在此时间内未成交，将自动取消并转为市价单（可选）"
     )
+    limit_order_auto_convert_to_market: bool = Field(
+        False,
+        env="LIMIT_ORDER_AUTO_CONVERT_TO_MARKET",
+        description="限价单超时后是否自动转为市价单。True=自动转换（可能有滑点风险），False=超时后直接失败（更安全）"
+    )
+    slippage_reject_order: bool = Field(
+        True,
+        env="SLIPPAGE_REJECT_ORDER",
+        description="滑点超限时是否拒绝订单。True=拒绝订单（更安全），False=仅警告但继续执行"
+    )
     trailing_exit_pct: float = Field(0.15, env="TRAILING_EXIT_PCT", description="滑动退出百分比（回撤幅度）")
     stop_loss_pct: float = Field(0.05, env="STOP_LOSS_PCT", description="入场价的止损百分比")
     report_recipient: str = Field("yezfm53@gmail.com", env="REPORT_RECIPIENT")
@@ -75,6 +85,13 @@ class Settings(BaseSettings):
     websocket_price_enabled: bool = Field(True, description="是否启用WebSocket价格订阅服务，启用后可大幅降低价格获取延迟")
     websocket_price_symbols: str | None = Field(None, env="WEBSOCKET_PRICE_SYMBOLS", description="WebSocket订阅的交易对列表（逗号分隔），如 'BTCUSDT,ETHUSDT'，如果为空则使用默认列表")
     websocket_subscribe_before_minutes: float = Field(5.0, description="在执行交易前多少分钟开始订阅WebSocket价格（默认5分钟）")
+
+    # 风险管理配置
+    risk_management_enabled: bool = Field(True, env="RISK_MANAGEMENT_ENABLED", description="是否启用风险管理模块")
+    max_daily_loss_pct: float = Field(0.1, env="MAX_DAILY_LOSS_PCT", description="单日最大亏损百分比（相对于初始余额），达到后暂停交易，默认10%")
+    max_drawdown_pct: float = Field(0.2, env="MAX_DRAWDOWN_PCT", description="最大回撤百分比（相对于历史最高余额），达到后暂停交易，默认20%")
+    max_position_concentration_pct: float = Field(0.5, env="MAX_POSITION_CONCENTRATION_PCT", description="单一标的最大仓位占比，默认50%")
+    max_total_leverage: int = Field(10, env="MAX_TOTAL_LEVERAGE", description="全局最大杠杆倍数，默认10x")
 
     alpha_feed_url: HttpUrl | str = Field(
         "https://www.binance.com/bapi/apex/v1/public/apex/announcement/getLatestList",

@@ -25,30 +25,54 @@ class ExecutionService:
         self.settings = settings or get_settings()
         self.client = BinanceFuturesClient(self.settings)
 
-    def calculate_order_size(self, symbol_price: Decimal, available_balance: Decimal, leverage: int | None = None) -> Decimal:
+    def calculate_order_size(
+        self,
+        symbol: str,
+        symbol_price: Decimal,
+        available_balance: Decimal,
+        leverage: int | None = None,
+        position_pct: float | None = None
+    ) -> Decimal:
         """根据可用保证金 * 配置比例来计算下单张数，并应用最大购买金额限制。
-        
+
         Args:
+            symbol: 交易对符号（用于获取精度信息）
             symbol_price: 交易对价格
             available_balance: 可用保证金
             leverage: 杠杆倍数，如果为None则使用系统默认杠杆
+            position_pct: 仓位比例，如果为None则使用系统默认配置
         """
+        # 使用传入的仓位比例，如果没有则使用系统默认配置
+        pct_to_use = position_pct if position_pct is not None else self.settings.position_pct
+        allocation = available_balance * Decimal(str(pct_to_use))
 
-        allocation = available_balance * Decimal(str(self.settings.position_pct))
         if allocation <= 0 or symbol_price <= 0:
             raise ValueError("无法计算下单数量")
-        
+
         # 应用最大购买金额限制
         if self.settings.max_order_amount:
             max_amount = Decimal(str(self.settings.max_order_amount))
             if allocation > max_amount:
                 logger.info("购买金额 %s 超过最大限制 %s，已限制为最大金额", allocation, max_amount)
                 allocation = max_amount
-        
+
         # 使用传入的杠杆，如果没有则使用系统默认杠杆
         leverage_to_use = Decimal(str(leverage)) if leverage is not None else Decimal(self.settings.leverage)
         quantity = allocation * leverage_to_use / symbol_price
-        return quantity.quantize(Decimal("0.001"))
+
+        # 动态获取交易对精度（stepSize），避免硬编码
+        from decimal import ROUND_DOWN
+        try:
+            symbol_info = self.client.get_symbol_info(symbol)
+            step_size = symbol_info.get("stepSize", Decimal("0.001"))
+            # 根据stepSize调整数量精度（向下取整，避免超额下单）
+            if step_size > 0:
+                quantity = (quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * step_size
+        except Exception as exc:
+            logger.warning("获取交易对 {} 精度信息失败，使用默认精度0.001: {}", symbol, exc)
+            quantity = quantity.quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+
+        return quantity
 
     def _check_slippage(self, expected_price: Decimal, actual_price: Decimal, side: str) -> tuple[bool, float]:
         """检查滑点是否在允许范围内
@@ -111,12 +135,18 @@ class ExecutionService:
             if order_result.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED"]:
                 actual_price = Decimal(str(order_result.get("avgPrice", expected_price))) if order_result.get("avgPrice") else expected_price
                 is_valid, slippage_pct = self._check_slippage(expected_price, actual_price, side)
-                
+
                 if not is_valid:
-                    logger.warning(
-                        "市价单滑点超过限制: 预期价格={}, 实际价格={}, 滑点={:.2f}%, 最大允许={:.2f}%",
-                        expected_price, actual_price, slippage_pct, self.settings.max_slippage_pct
+                    error_msg = (
+                        f"市价单滑点超过限制: 预期价格={expected_price}, 实际价格={actual_price}, "
+                        f"滑点={slippage_pct:.2f}%, 最大允许={self.settings.max_slippage_pct:.2f}%"
                     )
+                    logger.error(error_msg)
+                    # 如果配置为拒绝订单，则抛出异常（默认行为）
+                    if self.settings.slippage_reject_order:
+                        raise ValueError(error_msg)
+                    else:
+                        logger.warning("滑点超限但配置为继续执行，请注意风险")
                 else:
                     logger.debug("市价单滑点检查通过: 滑点={:.2f}%", slippage_pct)
         
@@ -178,16 +208,21 @@ class ExecutionService:
                 
                 time.sleep(0.5)  # 每0.5秒检查一次
             
-            # 超时或取消，转为市价单
+            # 超时或取消，根据配置决定是否转为市价单
             try:
                 self.client.cancel_order(symbol, order_id)
-                logger.info("限价单超时，已取消并转为市价单")
+                logger.info("限价单超时，已取消订单")
             except Exception as exc:
                 logger.warning("取消限价单失败: {}", exc)
-            
-            # 转为市价单
-            logger.info("限价单未成交，转为市价单")
-            return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+
+            # 根据配置决定是否转为市价单
+            if self.settings.limit_order_auto_convert_to_market:
+                logger.info("限价单未成交，根据配置转为市价单（可能有滑点风险）")
+                return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+            else:
+                error_msg = f"限价单超时未成交，且未配置自动转市价单，订单失败: {order_id}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
         else:
             return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
 
@@ -197,6 +232,14 @@ class ExecutionService:
         if not plan.announcement or not plan.announcement.symbol:
             raise ValueError("交易计划缺少交易对信息")
         symbol = f"{plan.announcement.symbol}USDT"
+
+        # 风险管理检查
+        from app.services.risk_management_service import RiskManagementService
+        risk_service = RiskManagementService(self.db, self.settings)
+        risk_check = risk_service.check_trading_allowed(symbol=symbol, leverage=plan.leverage)
+        if not risk_check.allowed:
+            logger.error("风险管理拒绝交易: {}", risk_check.reason)
+            raise ValueError(f"风险管理拒绝交易: {risk_check.reason}")
         
         # 确保WebSocket已订阅（如果启用）
         if self.settings.websocket_price_enabled:
@@ -211,7 +254,7 @@ class ExecutionService:
         balance = self.client.get_account_balance()
         mark_price = price_hint or self.client.get_mark_price(symbol) or Decimal("1")
         # 使用计划中的杠杆计算订单数量
-        quantity = self.calculate_order_size(mark_price, balance, leverage=plan.leverage)
+        quantity = self.calculate_order_size(symbol, mark_price, balance, leverage=plan.leverage)
         
         # 执行订单（根据配置选择市价单或限价单，并检查滑点）
         order_result = self._place_order_with_timeout(symbol, side, quantity, mark_price)
@@ -286,6 +329,14 @@ class ExecutionService:
         symbol = plan.symbol.upper()
         if not symbol.endswith("USDT"):
             symbol = f"{symbol}USDT"
+
+        # 风险管理检查
+        from app.services.risk_management_service import RiskManagementService
+        risk_service = RiskManagementService(self.db, self.settings)
+        risk_check = risk_service.check_trading_allowed(symbol=symbol, leverage=plan.leverage)
+        if not risk_check.allowed:
+            logger.error("风险管理拒绝手动计划交易: {}", risk_check.reason)
+            raise ValueError(f"风险管理拒绝交易: {risk_check.reason}")
         
         # 确保WebSocket已订阅（如果启用）
         if self.settings.websocket_price_enabled:
@@ -300,44 +351,39 @@ class ExecutionService:
         # 清除余额缓存，确保获取最新的可用保证金
         # 防止因为缓存导致使用过期的余额信息
         from app.services.binance_service import BinanceFuturesClient
-        with BinanceFuturesClient._cache_lock:
-            if "futures" in BinanceFuturesClient._balance_cache:
-                del BinanceFuturesClient._balance_cache["futures"]
-        
+        BinanceFuturesClient.clear_balance_cache("futures")
+
         # 使用合约账户余额（可用保证金）
         balance = self.client.get_futures_balance()
         mark_price = self.client.get_mark_price(symbol) or Decimal("1")
-        
+
         # 记录余额和价格信息
-        logger.info("执行计划 {}: 可用保证金={} USDT, 标记价格={}, 杠杆={}x, 仓位比例={}", 
+        logger.info("执行计划 {}: 可用保证金={} USDT, 标记价格={}, 杠杆={}x, 仓位比例={}",
                    plan.id, balance, mark_price, plan.leverage, plan.position_pct)
-        
-        # 使用计划中的仓位比例，而不是设置中的默认值
-        # 临时覆盖设置中的 position_pct
-        original_position_pct = self.settings.position_pct
-        self.settings.position_pct = plan.position_pct
-        
-        try:
-            # 传递计划中的杠杆参数，确保使用正确的杠杆计算订单数量
-            quantity = self.calculate_order_size(mark_price, balance, leverage=plan.leverage)
-            
-            # 计算实际需要的保证金
-            # 订单价值 = quantity * mark_price
-            order_value = quantity * mark_price
-            # 需要的保证金 = 订单价值 / 杠杆 = allocation（应该等于 balance * position_pct）
-            required_margin = order_value / Decimal(str(plan.leverage))
-            
-            logger.info("计划 {}: 计算数量={}, 订单价值={} USDT, 需要保证金={} USDT, 可用保证金={} USDT", 
-                       plan.id, quantity, order_value, required_margin, balance)
-            
-            # 检查保证金是否足够（留一点余量，避免精度问题）
-            if required_margin > balance * Decimal("0.99"):  # 留1%的余量
-                error_msg = f"保证金不足: 需要 {required_margin} USDT, 可用 {balance} USDT"
-                logger.error("计划 {}: {}", plan.id, error_msg)
-                raise ValueError(error_msg)
-        finally:
-            # 恢复原始设置
-            self.settings.position_pct = original_position_pct
+
+        # 直接传递计划中的仓位比例和杠杆，避免修改全局配置（并发安全）
+        quantity = self.calculate_order_size(
+            symbol,
+            mark_price,
+            balance,
+            leverage=plan.leverage,
+            position_pct=plan.position_pct
+        )
+
+        # 计算实际需要的保证金
+        # 订单价值 = quantity * mark_price
+        order_value = quantity * mark_price
+        # 需要的保证金 = 订单价值 / 杠杆 = allocation（应该等于 balance * position_pct）
+        required_margin = order_value / Decimal(str(plan.leverage))
+
+        logger.info("计划 {}: 计算数量={}, 订单价值={} USDT, 需要保证金={} USDT, 可用保证金={} USDT",
+                   plan.id, quantity, order_value, required_margin, balance)
+
+        # 检查保证金是否足够（留一点余量，避免精度问题）
+        if required_margin > balance * Decimal("0.99"):  # 留1%的余量
+            error_msg = f"保证金不足: 需要 {required_margin} USDT, 可用 {balance} USDT"
+            logger.error("计划 {}: {}", plan.id, error_msg)
+            raise ValueError(error_msg)
         
         # 执行订单（根据配置选择市价单或限价单，并检查滑点）
         order_result = self._place_order_with_timeout(symbol, plan.side.upper(), quantity, mark_price)

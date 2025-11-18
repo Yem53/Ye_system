@@ -20,9 +20,41 @@ class BinanceFuturesClient:
     _symbol_info_cache: dict[str, dict] = {}  # {symbol: {stepSize, tickSize, ...}}
     _cache_lock = Lock()
     
+    @classmethod
+    def clear_balance_cache(cls, balance_type: str | None = None) -> None:
+        """清除余额缓存（公共方法，线程安全）
+
+        Args:
+            balance_type: 要清除的缓存类型，可选值: "futures", "spot", "margin", "wallet"
+                         如果为None则清除所有缓存
+        """
+        with cls._cache_lock:
+            if balance_type is None:
+                cls._balance_cache.clear()
+                logger.debug("已清除所有余额缓存")
+            elif balance_type in cls._balance_cache:
+                del cls._balance_cache[balance_type]
+                logger.debug("已清除 {} 余额缓存", balance_type)
+
+    @classmethod
+    def clear_price_cache(cls, symbol: str | None = None) -> None:
+        """清除价格缓存（公共方法，线程安全）
+
+        Args:
+            symbol: 要清除的交易对，如果为None则清除所有价格缓存
+        """
+        with cls._cache_lock:
+            if symbol is None:
+                cls._price_cache.clear()
+                cls._all_prices_cache.clear()
+                logger.debug("已清除所有价格缓存")
+            elif symbol in cls._price_cache:
+                del cls._price_cache[symbol]
+                logger.debug("已清除 {} 价格缓存", symbol)
+
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        
+
         # 配置代理（如果设置了 HTTP_PROXY，支持 Clash 等 VPN 代理）
         proxies = None
         if self.settings.http_proxy or self.settings.https_proxy:
