@@ -1,0 +1,1442 @@
+{% extends "base.html" %}
+{% block content %}
+<!-- 实时账户信息 -->
+<div class="card" style="margin-bottom:1rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
+    <div class="card-content">
+        <div class="columns is-vcentered">
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">资金账户（资产总额）/ Wallet (Total Assets)</p>
+                <p class="title is-5" id="wallet-balance" style="color: white; font-size: 1.2rem;">加载中...</p>
+                <p class="help" style="color: rgba(255,255,255,0.6); font-size: 0.75rem;">sapi/v3/asset/getUserAsset</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">现货账户 / Spot</p>
+                <p class="title is-5" id="spot-balance" style="color: white; font-size: 1.2rem;">加载中...</p>
+                <p class="help" style="color: rgba(255,255,255,0.6); font-size: 0.75rem;">api/v3/account</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">合约账户 / Futures</p>
+                <p class="title is-5" id="futures-balance" style="color: white; font-size: 1.2rem;">加载中...</p>
+                <p class="help" style="color: rgba(255,255,255,0.6); font-size: 0.75rem;">fapi/v2/balance</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">总盈亏 / P&L</p>
+                <p class="title is-5" id="total-pnl" style="color: white; font-size: 1.2rem;">加载中...</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">活跃持仓 / Positions</p>
+                <p class="title is-5" id="position-count" style="color: white; font-size: 1.2rem;">0</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">最后更新 / Updated</p>
+                <p class="title is-6" id="last-update" style="color: white;">--</p>
+            </div>
+            <div class="column">
+                <p class="heading" style="color: rgba(255,255,255,0.8);">UTC 时间 / UTC Time</p>
+                <p class="title is-6" id="utc-time" style="color: white; font-family: 'Courier New', monospace;">--</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 实时持仓列表 -->
+<div class="card" style="margin-bottom:1rem;" id="positions-card">
+    <header class="card-header">
+        <p class="card-header-title">实时持仓 / Real-time Positions <span id="positions-badge" class="tag is-primary">0</span></p>
+        <button class="button is-small is-light" onclick="refreshDashboard()" style="margin: 0.5rem;">刷新 / Refresh</button>
+    </header>
+    <div class="card-content">
+        <div id="positions-container" style="transition: opacity 0.2s ease-in-out;">
+            <p class="has-text-grey">加载中... / Loading...</p>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-bottom:1rem;">
+    <header class="card-header">
+        <p class="card-header-title">手动下单计划 / Manual Trading Plans</p>
+    </header>
+    <div class="card-content">
+        <form method="post" action="/manual-plans" class="columns is-multiline">
+            <div class="column is-one-quarter">
+                <label class="label">合约符号 / Symbol</label>
+                <input class="input" name="symbol" placeholder="如 BTC (会自动添加USDT) / e.g. BTC" required>
+                <p class="help">只需输入币种，系统会自动添加USDT</p>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">方向 / Side</label>
+                <div class="select is-fullwidth">
+                    <select name="side">
+                        <option value="BUY">BUY</option>
+                        <option value="SELL">SELL</option>
+                    </select>
+                </div>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">上线时间 (UTC) / Listing Time</label>
+                <input class="input" name="listing_time" placeholder="2024-11-15T10:30:00Z" required>
+                <p class="help">使用UTC时间，格式：YYYY-MM-DDTHH:MM:SSZ / UTC time format</p>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">杠杆 / Leverage</label>
+                <input class="input" name="leverage" value="{{ default_leverage }}" type="number" step="1" min="1" max="125" required>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">仓位比例 / Position %</label>
+                <input class="input" name="position_pct" value="{{ default_position_pct }}" type="number" step="0.01" min="0.01" max="1" required>
+                <p class="help">使用可用保证金的百分比 (0.5 = 50%) / % of available margin</p>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">滑动退出% / Trailing Exit %</label>
+                <input class="input" name="trailing_exit_pct" value="{{ default_trailing_exit_pct }}" type="number" step="0.01" min="0" max="1" required>
+                <p class="help">从最高价回撤的百分比 (0.15 = 15%) / % pullback from high</p>
+            </div>
+            <div class="column is-one-quarter">
+                <label class="label">止损% / Stop Loss %</label>
+                <input class="input" name="stop_loss_pct" value="{{ default_stop_loss_pct }}" type="number" step="0.01" min="0" max="1" required>
+                <p class="help">从入场价下跌的百分比 (0.05 = 5%) / % drop from entry</p>
+            </div>
+            <div class="column is-full">
+                <label class="label">备注 / Notes</label>
+                <textarea class="textarea" name="notes" placeholder="可留空，用于记录测试信息等 / Optional notes"></textarea>
+            </div>
+            <div class="column is-full">
+                <button class="button is-primary" type="submit">创建手动计划 / Create Plan</button>
+                <p class="help" style="margin-top: 0.5rem;">
+                    <strong>提示 / Tip:</strong> 系统会在指定时间自动执行订单。如果配置了 MAX_ORDER_AMOUNT，单笔订单不会超过该限制。 / System will auto-execute at specified time. MAX_ORDER_AMOUNT limit applies if configured.
+                </p>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 系统配置 / System Settings -->
+<div class="card" style="margin-bottom:1rem;">
+    <header class="card-header">
+        <p class="card-header-title">系统配置 / System Settings</p>
+        <button class="button is-small is-light" onclick="loadSettings()" style="margin: 0.5rem;">刷新配置 / Refresh</button>
+    </header>
+    <div class="card-content">
+        <div id="settings-message" class="notification" style="display:none; margin-bottom:1rem;"></div>
+        <form id="settings-form" onsubmit="updateSettings(event)">
+            <div class="columns is-multiline">
+                <div class="column is-one-quarter">
+                    <label class="label">订单类型 / Order Type</label>
+                    <div class="select is-fullwidth">
+                        <select id="order_type" name="order_type" required>
+                            <option value="MARKET">MARKET (市价单)</option>
+                            <option value="LIMIT">LIMIT (限价单)</option>
+                        </select>
+                    </div>
+                    <p class="help">市价单成交快但可能有滑点，限价单可控制价格但可能不成交</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">最大滑点% / Max Slippage %</label>
+                    <input class="input" id="max_slippage_pct" name="max_slippage_pct" type="number" step="0.01" min="0" required>
+                    <p class="help">仅对市价单有效，超过此值会记录警告</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">限价单超时(秒) / Limit Order Timeout (s)</label>
+                    <input class="input" id="limit_order_timeout_seconds" name="limit_order_timeout_seconds" type="number" step="1" min="0" required>
+                    <p class="help">限价单超时后自动转为市价单</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">最大订单金额(USDT) / Max Order Amount (USDT)</label>
+                    <input class="input" id="max_order_amount" name="max_order_amount" type="number" step="0.01" min="0" placeholder="0表示无限制">
+                    <p class="help">单笔订单最大购买金额，0表示不限制</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">默认杠杆 / Default Leverage</label>
+                    <input class="input" id="leverage" name="leverage" type="number" step="1" min="1" max="125" required>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">仓位比例 / Position %</label>
+                    <input class="input" id="position_pct" name="position_pct" type="number" step="0.01" min="0.01" max="1" required>
+                    <p class="help">使用可用保证金的百分比 (0.5 = 50%)</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">滑动退出% / Trailing Exit %</label>
+                    <input class="input" id="trailing_exit_pct" name="trailing_exit_pct" type="number" step="0.01" min="0" max="1" required>
+                    <p class="help">从最高价回撤的百分比 (0.15 = 15%)</p>
+                </div>
+                <div class="column is-one-quarter">
+                    <label class="label">止损% / Stop Loss %</label>
+                    <input class="input" id="stop_loss_pct" name="stop_loss_pct" type="number" step="0.01" min="0" max="1" required>
+                    <p class="help">从入场价下跌的百分比 (0.05 = 5%)</p>
+                </div>
+                <div class="column is-full">
+                    <button class="button is-primary" type="submit">保存配置 / Save Settings</button>
+                    <p class="help" style="margin-top: 0.5rem;">
+                        <strong>注意 / Note:</strong> 配置保存后需要重启服务才能完全生效 / Settings require service restart to take full effect
+                    </p>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 历史操作记录链接 -->
+<div class="card" style="margin-bottom:1rem; background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+    <div class="card-content">
+        <div class="columns is-vcentered">
+            <div class="column">
+                <p class="title is-5" style="color: white; margin-bottom: 0.5rem;">
+                    📊 交易历史记录 / Trading History
+                </p>
+                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9);">
+                    查看所有买入、退出记录及退出条件，便于复盘和调整策略参数
+                </p>
+                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9);">
+                    View all buy/sell records and exit conditions for strategy review and parameter adjustment
+                </p>
+            </div>
+            <div class="column is-narrow">
+                <a href="/history" class="button is-large is-white is-outlined">
+                    <span class="icon">
+                        <i class="fas fa-history"></i>
+                    </span>
+                    <span>查看历史记录 / View History</span>
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card" style="margin-top: 1rem;">
+    <header class="card-header">
+                <p class="card-header-title">手动计划列表 / Manual Plans List (<span id="manual-plans-count">{{ manual_plans|length }}</span>)</p>
+    </header>
+    <div class="card-content scroll-box" id="manual-plans-container">
+        {% if manual_plans %}
+            <table class="table is-fullwidth is-striped is-narrow">
+                <thead>
+                <tr>
+                    <th>符号 / Symbol</th>
+                    <th>方向 / Side</th>
+                    <th>上线时间 / Listing Time</th>
+                    <th>杠杆 / Leverage</th>
+                    <th>仓位% / Position %</th>
+                    <th>状态 / Status</th>
+                    <th>操作 / Action</th>
+                </tr>
+                </thead>
+                <tbody id="manual-plans-tbody">
+                {% for plan in manual_plans %}
+                    <tr>
+                        <td>{{ plan.symbol }}</td>
+                        <td>{{ plan.side }}</td>
+                        <td>{{ plan.listing_time }}</td>
+                        <td>{{ plan.leverage }}</td>
+                        <td>{{ plan.position_pct }}</td>
+                        <td>{{ plan.status.value }}</td>
+                        <td>
+                            {% if plan.status.value in ['PENDING','ARMED','EXECUTING'] %}
+                            <form method="post" action="/manual-plans/{{ plan.id }}/cancel">
+                                <button class="button is-small is-light" type="submit">取消 / Cancel</button>
+                            </form>
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>暂无手动计划 / No manual plans</p>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+let refreshInterval;
+let currentRefreshRate = 1000; // 默认1秒刷新
+const HIGH_FREQ_RATE = 200; // 高频刷新：200毫秒（有持仓或临近交易时，仅HTTP fallback模式）
+const NORMAL_RATE = 1000; // 正常刷新：1秒（无持仓且无临近交易时，仅HTTP fallback模式）
+
+// 混合模式的刷新频率配置
+const HTTP_REFRESH_RATE_WS_CONNECTED = 1000; // WebSocket连接时，HTTP轮询频率（1秒，只更新余额和手动计划）
+const HTTP_REFRESH_RATE_WS_DISCONNECTED = 1000; // WebSocket未连接时，HTTP轮询频率（1秒，更新所有数据）
+
+// WebSocket连接
+let ws = null;
+let wsReconnectAttempts = 0;
+const MAX_WS_RECONNECT_ATTEMPTS = 5;
+let lastWebSocketUpdateTime = null; // 记录上次WebSocket更新时间
+
+// 格式化数字
+function formatNumber(num, decimals = 3) {
+    return parseFloat(num).toFixed(decimals);
+}
+
+// 格式化百分比
+function formatPercent(num) {
+    const sign = num >= 0 ? '+' : '';
+    return sign + formatNumber(num, 2) + '%';
+}
+
+// 更新账户信息
+function updateAccountInfo(data) {
+    const account = data.account || {};
+    
+    // 更新资金账户余额（精确到小数点后3位）
+    // sapi/v3/asset/getUserAsset - 钱包总资产（所有账户的总和）
+    const walletBalanceElement = document.getElementById('wallet-balance');
+    if (walletBalanceElement && account.wallet_balance !== undefined) {
+        const walletBalance = account.wallet_balance || 0;
+        walletBalanceElement.textContent = formatNumber(walletBalance, 3) + ' USDT';
+        walletBalanceElement.title = '资金账户余额（钱包总资产，所有账户的总和）API: sapi/v3/asset/getUserAsset';
+        walletBalanceElement.style.color = 'white';
+    }
+    
+    // 更新现货账户余额（精确到小数点后3位）
+    // api/v3/account - 现货交易账户余额
+    const spotBalanceElement = document.getElementById('spot-balance');
+    if (spotBalanceElement && account.spot_balance !== undefined) {
+        const spotBalance = account.spot_balance || 0;
+        spotBalanceElement.textContent = formatNumber(spotBalance, 3) + ' USDT';
+        spotBalanceElement.title = '现货账户余额 API: api/v3/account';
+        spotBalanceElement.style.color = 'white';
+    }
+    
+    // 更新合约账户余额（精确到小数点后3位）
+    // fapi/v2/balance - 合约交易账户可用余额
+    const futuresBalanceElement = document.getElementById('futures-balance');
+    if (futuresBalanceElement && (account.futures_balance !== undefined || account.balance !== undefined)) {
+        const futuresBalance = account.futures_balance || account.balance || 0;
+        futuresBalanceElement.textContent = formatNumber(futuresBalance, 3) + ' USDT';
+        futuresBalanceElement.title = '合约账户余额（可用余额）API: fapi/v2/balance';
+        futuresBalanceElement.style.color = 'white';
+    }
+    
+    // 更新总盈亏（混合模式：WebSocket连接时不更新，由WebSocket处理）
+    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+    if (!wsConnected && account.total_pnl !== undefined) {
+        // 只在WebSocket未连接时更新PnL（作为fallback）
+        updatePnlValue(account.total_pnl, 'http');
+    }
+    // 注意：如果WebSocket已连接，PnL由WebSocket的onmessage处理
+    
+    document.getElementById('position-count').textContent = data.position_count || 0;
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString('zh-CN');
+}
+
+// 更新UTC时间显示
+function updateUTCTime() {
+    const now = new Date();
+    const utcTime = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+    const utcTimeElement = document.getElementById('utc-time');
+    if (utcTimeElement) {
+        utcTimeElement.textContent = utcTime;
+    }
+}
+
+// 缓存上一次的持仓数据，用于增量更新
+let lastPositionsMap = new Map(); // id -> position data
+let positionsTable = null; // 缓存的表格DOM引用
+
+// PnL更新锁和缓存（防止WebSocket和HTTP冲突）
+let isUpdatingPnl = false;
+let lastPnlValue = null;
+
+// 统一的PnL更新函数（防止WebSocket和HTTP冲突）
+function updatePnlValue(pnl, source = 'http') {
+    // 防止并发更新
+    if (isUpdatingPnl) {
+        return;
+    }
+    
+    // 精度比较（保留3位小数）
+    const roundedPnl = Math.round(pnl * 1000) / 1000;
+    if (lastPnlValue !== null && Math.abs(roundedPnl - lastPnlValue) < 0.001) {
+        return; // 值没有变化，不更新
+    }
+    
+    isUpdatingPnl = true;
+    lastPnlValue = roundedPnl;
+    
+    requestAnimationFrame(() => {
+        const pnlElement = document.getElementById('total-pnl');
+        if (pnlElement) {
+            const currentPnlText = pnlElement.textContent.replace(' USDT', '').trim();
+            const newPnlText = formatNumber(pnl, 3);
+            
+            // 如果当前是"加载中"或值发生变化，就更新
+            if (currentPnlText === '加载中...' || currentPnlText === '加载中' || 
+                currentPnlText !== newPnlText) {
+                pnlElement.textContent = newPnlText + ' USDT';
+                pnlElement.title = `总盈亏 / Total P&L: ${formatPercent(pnl)}`;
+                pnlElement.style.color = pnl >= 0 ? '#23d160' : '#ff3860';
+            }
+        }
+        isUpdatingPnl = false;
+    });
+}
+
+// ========== 彻底重写的持仓更新系统 ==========
+// 使用单一数据源、严格去重、优化防抖、精确精度比较（支持1%退出策略）
+
+let positionUpdateDebounceTimer = null;
+let positionUpdateQueue = [];
+let isProcessingPositionQueue = false;
+// 防抖时间已内联到 updatePositions 函数中（200ms）
+
+// 全局更新锁：确保同时只有一个持仓更新在进行
+let isUpdatingPositions = false;
+
+// 数据快照：用于比较，只有真正变化才更新DOM（提高精度以支持1%的退出策略）
+let lastPositionsSnapshot = null;
+
+// 当前显示的持仓ID集合（用于去重）
+let currentDisplayedPositionIds = new Set();
+
+// 更新持仓列表（币安风格优化：移除防抖，提高精度，直接更新）
+function updatePositions(positions) {
+    // 全局锁：如果正在更新，直接返回
+    if (isUpdatingPositions) {
+        return;
+    }
+    
+    // 快速去重和验证
+    if (!positions || !Array.isArray(positions)) {
+        return;
+    }
+    
+    // 第一步：简单去重（基于ID）
+    const uniquePositionsMap = new Map();
+    for (const pos of positions) {
+        if (!pos || !pos.id) {
+            continue;
+        }
+        // 如果已存在，保留最新的数据
+        if (!uniquePositionsMap.has(pos.id)) {
+            uniquePositionsMap.set(pos.id, pos);
+        }
+    }
+    const uniquePositions = Array.from(uniquePositionsMap.values());
+    
+    // 第二步：生成数据快照（提高精度，币安风格：价格0.01，PnL 0.1%）
+    const snapshot = JSON.stringify(uniquePositions.map(p => ({
+        id: p.id,
+        price: Math.round((p.current_price || 0) * 100) / 100,    // 价格精度：0.01（币安风格）
+        pnlPct: Math.round((p.pnl_pct || 0) * 1000) / 1000,      // 盈亏百分比精度：0.1%（币安风格）
+        pnlValue: Math.round((p.pnl_value || 0) * 100) / 100      // 盈亏金额精度：0.01 USDT（币安风格）
+    })).sort((a, b) => a.id.localeCompare(b.id)));
+    
+    // 第三步：如果数据没有实质性变化，直接返回（避免不必要的更新）
+    if (lastPositionsSnapshot === snapshot) {
+        return;
+    }
+    
+    // 更新快照
+    lastPositionsSnapshot = snapshot;
+    
+    // 第四步：币安风格 - 直接更新，无防抖（使用requestAnimationFrame确保平滑）
+    requestAnimationFrame(() => {
+        _updatePositionsInternal(uniquePositions);
+    });
+}
+
+// 处理更新队列（已废弃，现在直接更新）
+// 保留此函数以防其他地方调用，但实际逻辑已移到updatePositions中
+function processPositionUpdateQueue() {
+    // 此函数已废弃，现在直接使用requestAnimationFrame更新
+    // 保留以防其他地方调用
+}
+
+// 内部更新函数（彻底重写：简化逻辑，减少DOM操作）
+function _updatePositionsInternal(positions) {
+    // 全局锁：设置更新标志
+    if (isUpdatingPositions) {
+        return; // 如果已经在更新，直接返回
+    }
+    isUpdatingPositions = true;
+    
+    try {
+        const container = document.getElementById('positions-container');
+        const badge = document.getElementById('positions-badge');
+        
+        if (!container || !badge) {
+            isUpdatingPositions = false;
+            return;
+        }
+        
+        // positions已经在processPositionUpdateQueue中去重了，这里再次确保
+        const uniquePositionsMap = new Map();
+        for (const pos of positions) {
+            if (!pos || !pos.id) {
+                continue;
+            }
+            if (!uniquePositionsMap.has(pos.id)) {
+                uniquePositionsMap.set(pos.id, pos);
+            }
+        }
+        const uniquePositions = Array.from(uniquePositionsMap.values());
+        
+        // 更新数量徽章
+        const positionCount = uniquePositions.length;
+        const currentBadgeCount = parseInt(badge.textContent) || 0;
+        if (positionCount !== currentBadgeCount) {
+            badge.textContent = positionCount;
+        }
+        
+        // 如果无持仓，显示空状态
+        if (uniquePositions.length === 0) {
+            if (container.querySelector('table')) {
+                container.innerHTML = '<p class="has-text-grey">暂无活跃持仓 / No active positions</p>';
+                positionsTable = null;
+                lastPositionsMap.clear();
+                currentDisplayedPositionIds.clear();
+            }
+            lastPositionsSnapshot = null;
+            isUpdatingPositions = false;
+            return;
+        }
+        
+        // 生成新的持仓ID集合
+        const newPositionIds = new Set(uniquePositions.map(p => p.id));
+        
+        // 检查是否需要完全重建表格（如果持仓ID集合发生变化）
+        const needsRebuild = 
+            !positionsTable || 
+            !container.querySelector('table') ||
+            newPositionIds.size !== currentDisplayedPositionIds.size ||
+            Array.from(newPositionIds).some(id => !currentDisplayedPositionIds.has(id)) ||
+            Array.from(currentDisplayedPositionIds).some(id => !newPositionIds.has(id));
+        
+        if (needsRebuild) {
+            // 完全重建表格（避免增量更新的复杂性）
+            createPositionsTable(container, uniquePositions);
+            currentDisplayedPositionIds = new Set(newPositionIds);
+            lastPositionsSnapshot = JSON.stringify(uniquePositions.map(p => ({
+                id: p.id,
+                price: Math.round((p.current_price || 0) * 100) / 100,    // 价格精度：0.01（币安风格）
+                pnlPct: Math.round((p.pnl_pct || 0) * 1000) / 1000,        // 盈亏百分比精度：0.1%（币安风格）
+                pnlValue: Math.round((p.pnl_value || 0) * 100) / 100      // 盈亏金额精度：0.01 USDT（币安风格）
+            })).sort((a, b) => a.id.localeCompare(b.id)));
+            isUpdatingPositions = false;
+            return;
+        }
+        
+        // 增量更新：只更新变化的单元格（仅在持仓ID集合不变时）
+        if (!positionsTable) {
+            positionsTable = container.querySelector('table');
+        }
+        
+        if (!positionsTable) {
+            createPositionsTable(container, uniquePositions);
+            currentDisplayedPositionIds = new Set(newPositionIds);
+            lastPositionsSnapshot = JSON.stringify(uniquePositions.map(p => ({
+                id: p.id,
+                price: Math.round((p.current_price || 0) * 100) / 100,    // 价格精度：0.01（币安风格）
+                pnlPct: Math.round((p.pnl_pct || 0) * 1000) / 1000,        // 盈亏百分比精度：0.1%（币安风格）
+                pnlValue: Math.round((p.pnl_value || 0) * 100) / 100      // 盈亏金额精度：0.01 USDT（币安风格）
+            })).sort((a, b) => a.id.localeCompare(b.id)));
+            isUpdatingPositions = false;
+            return;
+        }
+        
+        const tbody = positionsTable.querySelector('tbody');
+        if (!tbody) {
+            createPositionsTable(container, uniquePositions);
+            currentDisplayedPositionIds = new Set(newPositionIds);
+            lastPositionsSnapshot = JSON.stringify(uniquePositions.map(p => ({
+                id: p.id,
+                price: Math.round((p.current_price || 0) * 100) / 100,    // 价格精度：0.01（币安风格）
+                pnlPct: Math.round((p.pnl_pct || 0) * 1000) / 1000,        // 盈亏百分比精度：0.1%（币安风格）
+                pnlValue: Math.round((p.pnl_value || 0) * 100) / 100      // 盈亏金额精度：0.01 USDT（币安风格）
+            })).sort((a, b) => a.id.localeCompare(b.id)));
+            isUpdatingPositions = false;
+            return;
+        }
+        
+        // 创建新的持仓映射
+        const newPositionsMap = new Map();
+        uniquePositions.forEach(pos => {
+            newPositionsMap.set(pos.id, pos);
+        });
+        
+        // 更新现有行（只更新变化的单元格）
+        const existingRows = new Map();
+        Array.from(tbody.querySelectorAll('tr')).forEach(row => {
+            const rowId = row.getAttribute('data-position-id');
+            if (rowId && newPositionsMap.has(rowId)) {
+                // 只保留需要更新的行
+                if (!existingRows.has(rowId)) {
+                    existingRows.set(rowId, row);
+                } else {
+                    // 如果DOM中有重复行，删除多余的
+                    row.remove();
+                }
+            } else if (rowId) {
+                // 删除不存在的行
+                row.remove();
+            }
+        });
+        
+        // 更新或创建行
+        uniquePositions.forEach((pos) => {
+            let row = existingRows.get(pos.id);
+            const lastPos = lastPositionsMap.get(pos.id);
+            
+            if (!row) {
+                // 新行：创建并追加到末尾
+                row = createPositionRow(pos);
+                tbody.appendChild(row);
+            } else {
+                // 现有行：只更新变化的单元格
+                updatePositionRow(row, pos, lastPos);
+            }
+        });
+        
+        // 更新缓存和快照
+        lastPositionsMap = newPositionsMap;
+        currentDisplayedPositionIds = new Set(newPositionIds);
+        lastPositionsSnapshot = JSON.stringify(uniquePositions.map(p => ({
+            id: p.id,
+            price: Math.round((p.current_price || 0) * 100) / 100,        // 价格精度：0.01（币安风格）
+            pnlPct: Math.round((p.pnl_pct || 0) * 1000) / 1000,          // 盈亏百分比精度：0.1%（币安风格）
+            pnlValue: Math.round((p.pnl_value || 0) * 100) / 100          // 盈亏金额精度：0.01 USDT（币安风格）
+        })).sort((a, b) => a.id.localeCompare(b.id)));
+        
+        isUpdatingPositions = false;
+    } catch (error) {
+        console.error('更新持仓时出错:', error);
+        isUpdatingPositions = false;
+    }
+}
+
+// 创建持仓表格
+function createPositionsTable(container, positions) {
+    const fragment = document.createDocumentFragment();
+    const table = document.createElement('table');
+    table.className = 'table is-fullwidth is-striped is-hoverable';
+    
+    // 表头（两行显示）
+    const thead = document.createElement('thead');
+    thead.innerHTML = `
+        <tr>
+            <th rowspan="2">交易对 / Symbol</th>
+            <th rowspan="2">方向 / Side</th>
+            <th rowspan="2">入场价 / Entry</th>
+            <th rowspan="2">当前价 / Current</th>
+            <th rowspan="2">数量 / Quantity</th>
+            <th rowspan="2">杠杆 / Leverage</th>
+            <th rowspan="2">盈亏% / P&L %</th>
+            <th rowspan="2">盈亏金额 / P&L Value</th>
+            <th rowspan="2">本金 / Principal</th>
+            <th colspan="4">滑动退出监控 / Trailing Stop Monitor</th>
+            <th rowspan="2">操作 / Actions</th>
+        </tr>
+        <tr>
+            <th>最高/最低 / High/Low</th>
+            <th>触发价 / Trigger</th>
+            <th>距离 / Distance</th>
+            <th>止损/滑动% / Stop/Trail %</th>
+        </tr>
+    `;
+    table.appendChild(thead);
+    
+    // 表体
+    const tbody = document.createElement('tbody');
+    positions.forEach(pos => {
+        const row = createPositionRow(pos);
+        tbody.appendChild(row);
+        // 如果有第二行，也添加
+        if (row._detailRow) {
+            tbody.appendChild(row._detailRow);
+        }
+    });
+    table.appendChild(tbody);
+    
+    fragment.appendChild(table);
+    
+    // 直接替换，不使用淡入淡出（避免闪烁）
+    container.innerHTML = '';
+    container.appendChild(fragment);
+    positionsTable = table;
+    lastPositionsMap = new Map(positions.map(p => [p.id, p]));
+    currentDisplayedPositionIds = new Set(positions.map(p => p.id));
+}
+
+// 创建持仓行（两行显示）
+function createPositionRow(pos) {
+    const row = document.createElement('tr');
+    row.setAttribute('data-position-id', pos.id);
+    
+    const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
+    
+    const stopLossPct = (pos.stop_loss_pct || 0) * 100;
+    const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
+    const principal = pos.principal || 0;
+    
+    // 显示最高/最低价（用于滑动退出追踪）
+    let highLowText = '-';
+    if (pos.highest_price && pos.lowest_price) {
+        if (pos.side === 'BUY') {
+            highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price, 3)}</span> / ${formatNumber(pos.lowest_price, 3)}`;
+        } else {
+            highLowText = `${formatNumber(pos.highest_price, 3)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price, 3)}</span>`;
+        }
+    } else if (pos.highest_price) {
+        highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price, 3)}</span> / -`;
+    } else if (pos.lowest_price) {
+        highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price, 3)}</span>`;
+    }
+    
+    // 显示滑动退出触发价和距离
+    let trailingStopText = '-';
+    let distanceText = '-';
+    let distanceClass = '';
+    if (pos.trailing_stop_price !== null && pos.trailing_stop_price !== undefined) {
+        trailingStopText = formatNumber(pos.trailing_stop_price, 3);
+        if (pos.trailing_stop_distance !== null && pos.trailing_stop_distance !== undefined) {
+            const distance = pos.trailing_stop_distance;
+            if (distance < 0) {
+                distanceText = `<span class="has-text-danger">${formatNumber(Math.abs(distance), 3)} (已触发)</span>`;
+                distanceClass = 'has-text-danger';
+            } else {
+                distanceText = `<span class="has-text-success">${formatNumber(distance, 3)}</span>`;
+                distanceClass = 'has-text-success';
+            }
+        }
+    }
+    
+    // 显示当前价与最高/最低价的对比
+    let priceComparisonText = '-';
+    if (pos.side === 'BUY' && pos.highest_price) {
+        const diffFromHigh = pos.current_price - pos.highest_price;
+        const diffPct = (diffFromHigh / pos.highest_price) * 100;
+        priceComparisonText = `<span class="${diffFromHigh >= 0 ? 'has-text-success' : 'has-text-danger'}" title="当前价相对最高价: ${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%">${formatNumber(pos.current_price, 3)} (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%)</span>`;
+    } else if (pos.side === 'SELL' && pos.lowest_price) {
+        const diffFromLow = pos.current_price - pos.lowest_price;
+        const diffPct = (diffFromLow / pos.lowest_price) * 100;
+        priceComparisonText = `<span class="${diffFromLow <= 0 ? 'has-text-success' : 'has-text-danger'}" title="当前价相对最低价: ${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%">${formatNumber(pos.current_price, 3)} (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%)</span>`;
+    }
+    
+    row.innerHTML = `
+        <td rowspan="2"><strong>${pos.symbol}</strong></td>
+        <td rowspan="2"><span class="tag ${pos.side === 'BUY' ? 'is-success' : 'is-danger'}">${pos.side}</span></td>
+        <td rowspan="2" data-field="entry_price">${formatNumber(pos.entry_price, 3)}</td>
+        <td rowspan="2" data-field="current_price"><strong>${formatNumber(pos.current_price, 3)}</strong></td>
+        <td rowspan="2" data-field="quantity">${formatNumber(pos.quantity, 3)}</td>
+        <td rowspan="2" data-field="leverage">${pos.leverage}x</td>
+        <td rowspan="2" data-field="pnl_pct" class="${pnlClass}"><strong>${formatPercent(pos.pnl_pct)}</strong></td>
+        <td rowspan="2" data-field="pnl_value" class="${pnlClass}"><strong>${formatNumber(pos.pnl_value || 0, 3)} USDT</strong></td>
+        <td rowspan="2" data-field="principal"><strong>${formatNumber(principal, 3)} USDT</strong></td>
+        <td data-field="high_low">${highLowText}</td>
+        <td data-field="trailing_stop_price">${trailingStopText}</td>
+        <td data-field="trailing_stop_distance" class="${distanceClass}">${distanceText}</td>
+        <td data-field="stop_trail_pct">${stopLossPct.toFixed(2)}% / ${trailingExitPct.toFixed(2)}%</td>
+        <td rowspan="2">
+            <button class="button is-small is-info" onclick="editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})">
+                编辑 / Edit
+            </button>
+        </td>
+    `;
+    
+    // 添加第二行（显示价格对比）
+    const row2 = document.createElement('tr');
+    row2.setAttribute('data-position-id', pos.id + '-detail');
+    row2.innerHTML = `
+        <td colspan="4" data-field="price_comparison" style="font-size: 0.9em; color: #666;">
+            <strong>价格对比 / Price Comparison:</strong> ${priceComparisonText}
+        </td>
+    `;
+    
+    // 返回第一行，第二行需要单独处理
+    // 注意：这里返回row，第二行会在外部添加
+    row._detailRow = row2;  // 将第二行附加到第一行上，方便后续处理
+    return row;
+}
+
+// 更新持仓行（只更新变化的单元格）- 方案1+4：增强精度比较 + 使用textContent
+function updatePositionRow(row, pos, lastPos) {
+    if (!lastPos) {
+        // 如果没有上次数据，完全更新
+        const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
+        const stopLossPct = (pos.stop_loss_pct || 0) * 100;
+        const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
+        
+        // 显示最高/最低价（用于滑动退出追踪）
+        let highLowText = '-';
+        if (pos.highest_price && pos.lowest_price) {
+            if (pos.side === 'BUY') {
+                highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price)}</span> / ${formatNumber(pos.lowest_price)}`;
+            } else {
+                highLowText = `${formatNumber(pos.highest_price)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price)}</span>`;
+            }
+        } else if (pos.highest_price) {
+            highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price)}</span> / -`;
+        } else if (pos.lowest_price) {
+            highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price)}</span>`;
+        }
+        
+        row.innerHTML = `
+            <td><strong>${pos.symbol}</strong></td>
+            <td><span class="tag ${pos.side === 'BUY' ? 'is-success' : 'is-danger'}">${pos.side}</span></td>
+            <td data-field="entry_price">${formatNumber(pos.entry_price)}</td>
+            <td data-field="current_price"><strong>${formatNumber(pos.current_price)}</strong></td>
+            <td data-field="quantity">${formatNumber(pos.quantity)}</td>
+            <td data-field="leverage">${pos.leverage}x</td>
+            <td data-field="pnl_pct" class="${pnlClass}"><strong>${formatPercent(pos.pnl_pct)}</strong></td>
+            <td data-field="pnl_value" class="${pnlClass}"><strong>${formatNumber(pos.pnl_value || 0)} USDT</strong></td>
+            <td data-field="high_low">${highLowText}</td>
+            <td data-field="stop_loss_pct">${stopLossPct.toFixed(2)}%</td>
+            <td data-field="trailing_exit_pct">${trailingExitPct.toFixed(2)}%</td>
+            <td>
+                <button class="button is-small is-info" onclick="editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})">
+                    编辑 / Edit
+                </button>
+            </td>
+        `;
+        return;
+    }
+    
+    // 币安风格：精确比较（价格0.01，PnL 0.1%），但不过度过滤
+    const roundPrice = (p) => Math.round(p * 100) / 100;  // 0.01精度
+    const roundPnl = (p) => Math.round(p * 1000) / 1000;  // 0.1%精度（0.001）
+    const roundValue = (v) => Math.round(v * 100) / 100;   // 0.01精度
+    
+    // 当前价：只在真正变化时才更新（币安风格：精确比较）
+    const priceDiff = Math.abs(roundPrice(pos.current_price) - roundPrice(lastPos.current_price));
+    if (priceDiff >= 0.01) {  // 0.01或以上才更新
+        const cell = row.querySelector('[data-field="current_price"]');
+        if (cell) {
+            // 使用textContent替代innerHTML（减少重排，币安风格）
+            const strongTag = cell.querySelector('strong');
+            if (strongTag) {
+                strongTag.textContent = formatNumber(pos.current_price);
+            } else {
+                cell.textContent = formatNumber(pos.current_price);
+            }
+        }
+    }
+    
+    // 盈亏百分比：只在真正变化时才更新（币安风格：0.1%精度）
+    const pnlPctDiff = Math.abs(roundPnl(pos.pnl_pct) - roundPnl(lastPos.pnl_pct));
+    if (pnlPctDiff >= 0.001) {  // 0.1%或以上才更新
+        const cell = row.querySelector('[data-field="pnl_pct"]');
+        if (cell) {
+            const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
+            cell.className = pnlClass;
+            // 使用textContent替代innerHTML（币安风格）
+            const strongTag = cell.querySelector('strong');
+            if (strongTag) {
+                strongTag.textContent = formatPercent(pos.pnl_pct);
+            } else {
+                cell.textContent = formatPercent(pos.pnl_pct);
+            }
+        }
+    }
+    
+    // 盈亏金额：只在真正变化时才更新（币安风格：0.01精度）
+    const valueDiff = Math.abs(roundValue(pos.pnl_value || 0) - roundValue(lastPos.pnl_value || 0));
+    if (valueDiff >= 0.01) {  // 0.01 USDT或以上才更新
+        const cell = row.querySelector('[data-field="pnl_value"]');
+        if (cell) {
+            const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
+            cell.className = pnlClass;
+            // 使用textContent替代innerHTML（币安风格）
+            const strongTag = cell.querySelector('strong');
+            if (strongTag) {
+                strongTag.textContent = formatNumber(pos.pnl_value || 0) + ' USDT';
+            } else {
+                cell.textContent = formatNumber(pos.pnl_value || 0) + ' USDT';
+            }
+        }
+    }
+    
+    // 更新最高/最低价（如果变化）
+    const highLowCell = row.querySelector('[data-field="high_low"]');
+    if (highLowCell) {
+        let highLowText = '-';
+        if (pos.highest_price && pos.lowest_price) {
+            if (pos.side === 'BUY') {
+                highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price)}</span> / ${formatNumber(pos.lowest_price)}`;
+            } else {
+                highLowText = `${formatNumber(pos.highest_price)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price)}</span>`;
+            }
+        } else if (pos.highest_price) {
+            highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price)}</span> / -`;
+        } else if (pos.lowest_price) {
+            highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price)}</span>`;
+        }
+        const lastHighLowText = lastPos ? 
+            ((lastPos.highest_price && lastPos.lowest_price) ? 
+                `${formatNumber(lastPos.highest_price)}/${formatNumber(lastPos.lowest_price)}` : 
+                (lastPos.highest_price ? formatNumber(lastPos.highest_price) : (lastPos.lowest_price ? formatNumber(lastPos.lowest_price) : '-'))) : 
+            '';
+        const currentHighLowText = (pos.highest_price && pos.lowest_price) ? 
+            `${formatNumber(pos.highest_price)}/${formatNumber(pos.lowest_price)}` : 
+            (pos.highest_price ? formatNumber(pos.highest_price) : (pos.lowest_price ? formatNumber(pos.lowest_price) : '-'));
+        if (currentHighLowText !== lastHighLowText) {
+            highLowCell.innerHTML = highLowText;
+        }
+    }
+    
+    // 更新退出参数（如果变化）
+    const stopLossPct = (pos.stop_loss_pct || 0) * 100;
+    const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
+    const lastStopLossPct = (lastPos.stop_loss_pct || 0) * 100;
+    const lastTrailingExitPct = (lastPos.trailing_exit_pct || 0) * 100;
+    
+    if (Math.abs(stopLossPct - lastStopLossPct) > 0.01) {
+        const cell = row.querySelector('[data-field="stop_loss_pct"]');
+        if (cell) {
+            cell.textContent = stopLossPct.toFixed(2) + '%';
+        }
+    }
+    
+    if (Math.abs(trailingExitPct - lastTrailingExitPct) > 0.01) {
+        const cell = row.querySelector('[data-field="trailing_exit_pct"]');
+        if (cell) {
+            cell.textContent = trailingExitPct.toFixed(2) + '%';
+        }
+    }
+    
+    // 更新编辑按钮（确保使用最新的参数）
+    const actionCell = row.querySelector('td:last-child');
+    if (actionCell) {
+        const button = actionCell.querySelector('button');
+        if (button) {
+            button.setAttribute('onclick', `editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})`);
+        }
+    }
+}
+
+// 连接WebSocket
+function connectWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/ws/realtime`;
+    
+    try {
+        ws = new WebSocket(wsUrl);
+        
+        ws.onopen = function() {
+            console.log('WebSocket连接已建立，切换到混合模式（WebSocket推送持仓和PnL，HTTP轮询余额和手动计划）');
+            wsReconnectAttempts = 0;
+            
+            // WebSocket连接后，调整HTTP轮询频率为3秒（只更新余额和手动计划）
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+            currentRefreshRate = HTTP_REFRESH_RATE_WS_CONNECTED;
+            refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+            
+            // 立即刷新一次（获取余额和手动计划）
+            refreshDashboard();
+        };
+        
+        ws.onmessage = function(event) {
+            try {
+                const message = JSON.parse(event.data);
+                if (message.type === 'positions_update') {
+                    // 记录WebSocket更新时间
+                    lastWebSocketUpdateTime = Date.now();
+                    
+                    // 去重：确保WebSocket推送的持仓数据没有重复
+                    const positions = message.data.positions || [];
+                    const uniquePositions = [];
+                    const seenIds = new Set();
+                    for (const pos of positions) {
+                        if (!seenIds.has(pos.id)) {
+                            seenIds.add(pos.id);
+                            uniquePositions.push(pos);
+                        } else {
+                            console.warn('WebSocket推送的持仓数据有重复ID（已过滤）:', pos.id, pos.symbol);
+                        }
+                    }
+                    
+                    // 实时更新持仓数据（来自WebSocket，优先级高于HTTP轮询）
+                    // WebSocket是主要数据源，直接更新
+                    updatePositions(uniquePositions);
+                    // 同时更新PnL（来自WebSocket，使用统一函数避免冲突）
+                    if (message.data.total_pnl !== undefined) {
+                        updatePnlValue(message.data.total_pnl, 'websocket');
+                    }
+                    // 更新持仓数量（使用去重后的数量）
+                    const countElement = document.getElementById('position-count');
+                    if (countElement) {
+                        countElement.textContent = uniquePositions.length || 0;
+                    }
+                }
+            } catch (error) {
+                console.error('解析WebSocket消息失败:', error);
+            }
+        };
+        
+        ws.onerror = function(error) {
+            console.error('WebSocket错误:', error);
+        };
+        
+        ws.onclose = function() {
+            console.log('WebSocket连接已断开，切换到完整HTTP轮询模式（fallback）');
+            ws = null;
+            
+            // WebSocket断开后，切换到完整HTTP轮询模式（1秒，更新所有数据）
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+            currentRefreshRate = HTTP_REFRESH_RATE_WS_DISCONNECTED;
+            refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+            
+            // 立即刷新一次（获取所有数据）
+            refreshDashboard();
+            
+            // 尝试重连
+            if (wsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
+                wsReconnectAttempts++;
+                setTimeout(connectWebSocket, 2000 * wsReconnectAttempts); // 指数退避
+            } else {
+                console.warn('WebSocket重连次数已达上限，使用完整HTTP轮询模式');
+            }
+        };
+    } catch (error) {
+        console.error('创建WebSocket连接失败，使用完整HTTP轮询模式:', error);
+        // 确保HTTP轮询继续运行（如果定时器不存在则创建）
+        if (!refreshInterval) {
+            currentRefreshRate = HTTP_REFRESH_RATE_WS_DISCONNECTED;
+            refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+        }
+    }
+}
+
+// 更新手动计划表
+async function updateManualPlans() {
+    try {
+        const timestamp = new Date().getTime();
+        const response = await fetch(`/api/manual-plans?t=${timestamp}`, {
+            method: 'GET',
+            cache: 'no-cache',
+            headers: {
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache'
+            }
+        });
+        const plans = await response.json();
+        
+        const container = document.getElementById('manual-plans-container');
+        const countElement = document.getElementById('manual-plans-count');
+        
+        if (countElement) {
+            countElement.textContent = plans.length;
+        }
+        
+        if (plans.length === 0) {
+            container.innerHTML = '<p>暂无手动计划 / No manual plans</p>';
+            return;
+        }
+        
+        let html = '<table class="table is-fullwidth is-striped is-narrow">';
+        html += '<thead><tr>';
+        html += '<th>符号 / Symbol</th><th>方向 / Side</th><th>上线时间 / Listing Time</th>';
+        html += '<th>杠杆 / Leverage</th><th>仓位% / Position %</th><th>状态 / Status</th><th>操作 / Action</th>';
+        html += '</tr></thead><tbody>';
+        
+        plans.forEach(plan => {
+            // 处理状态（可能是字符串或对象）
+            const status = typeof plan.status === 'string' ? plan.status : (plan.status?.value || plan.status || 'PENDING');
+            const canCancel = ['PENDING', 'ARMED', 'EXECUTING'].includes(status);
+            
+            // 格式化日期时间
+            let listingTime = '';
+            if (plan.listing_time) {
+                try {
+                    const date = new Date(plan.listing_time);
+                    listingTime = date.toLocaleString('zh-CN', { timeZone: 'UTC' }) + ' UTC';
+                } catch (e) {
+                    listingTime = plan.listing_time;
+                }
+            }
+            
+            html += '<tr>';
+            html += `<td>${plan.symbol || ''}</td>`;
+            html += `<td>${plan.side || ''}</td>`;
+            html += `<td>${listingTime}</td>`;
+            html += `<td>${plan.leverage || ''}</td>`;
+            html += `<td>${plan.position_pct || ''}</td>`;
+            html += `<td>${status}</td>`;
+            html += '<td>';
+            if (canCancel) {
+                html += `<form method="post" action="/manual-plans/${plan.id}/cancel">`;
+                html += '<button class="button is-small is-light" type="submit">取消 / Cancel</button>';
+                html += '</form>';
+            } else {
+                html += '-';
+            }
+            html += '</td>';
+            html += '</tr>';
+        });
+        
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (error) {
+        console.error('更新手动计划表失败:', error);
+    }
+}
+
+// 刷新账户信息（已废弃，现在统一使用 refreshDashboard）
+async function refreshAccountInfo() {
+    // 为了兼容性保留，但实际调用 refreshDashboard
+    await refreshDashboard();
+}
+
+// 刷新仪表盘数据（混合模式：WebSocket推送持仓和PnL，HTTP轮询余额和手动计划）
+let isRefreshing = false; // 防止并发刷新
+let lastRefreshTime = 0; // 上次刷新时间
+const MIN_REFRESH_INTERVAL = 100; // 最小刷新间隔（毫秒），防止过于频繁
+
+async function refreshDashboard() {
+    // 防止并发刷新
+    if (isRefreshing) {
+        return;
+    }
+    
+    const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+    
+    // 根据WebSocket连接状态调整最小刷新间隔
+    const minInterval = wsConnected ? 500 : MIN_REFRESH_INTERVAL; // WebSocket连接时，HTTP轮询间隔更大
+    
+    // 节流：确保刷新间隔不小于最小值
+    const now = Date.now();
+    if (now - lastRefreshTime < minInterval) {
+        return;
+    }
+    lastRefreshTime = now;
+    
+    isRefreshing = true;
+    try {
+        // 添加时间戳和cache控制，防止浏览器缓存
+        const timestamp = new Date().getTime();
+        const response = await fetch(`/api/realtime/dashboard?t=${timestamp}`, {
+            method: 'GET',
+            cache: 'no-cache',
+            headers: {
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache'
+            }
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        const wsConnected = ws && ws.readyState === WebSocket.OPEN;
+        
+        if (wsConnected) {
+            // WebSocket已连接：混合模式
+            // 更新余额和手动计划（持仓和PnL主要由WebSocket推送，HTTP作为fallback）
+            updateAccountInfo({
+                account: {
+                    spot_balance: data.account.spot_balance,
+                    wallet_balance: data.account.wallet_balance,
+                    futures_balance: data.account.futures_balance,
+                    // total_pnl 不更新，由WebSocket处理
+                },
+                position_count: data.position_count  // 持仓数量由HTTP更新（作为补充）
+            });
+            
+            // 更新手动计划表（低频，1秒一次）
+            await updateManualPlans();
+            
+            // WebSocket连接时，HTTP轮询也作为fallback更新持仓（但频率较低，2秒一次）
+            // 这样可以确保即使WebSocket推送有问题，持仓也能更新
+            if (data.positions && data.positions.length > 0) {
+                // 只有在WebSocket可能有问题时才通过HTTP更新（作为fallback）
+                // 检查上次WebSocket更新时间，如果超过3秒没有更新，则使用HTTP数据
+                const now = Date.now();
+                if (!lastWebSocketUpdateTime || (now - lastWebSocketUpdateTime > 3000)) {
+                    console.log('WebSocket可能有问题，使用HTTP数据作为fallback更新持仓');
+                    updatePositions(data.positions);
+                }
+            }
+            
+            // WebSocket连接时，HTTP轮询频率固定为2秒（更新余额和手动计划，必要时更新持仓）
+            const targetRefreshRate = 2000; // 2秒，降低HTTP轮询频率
+            if (currentRefreshRate !== targetRefreshRate) {
+                if (refreshInterval) {
+                    clearInterval(refreshInterval);
+                }
+                currentRefreshRate = targetRefreshRate;
+                refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+                console.log(`混合模式：WebSocket已连接，HTTP轮询频率调整为 ${currentRefreshRate}ms（更新余额和手动计划，必要时更新持仓）`);
+            }
+        } else {
+            // WebSocket未连接：完整HTTP轮询模式（fallback）
+            // 更新所有数据（余额、持仓、PnL、手动计划）
+            updateAccountInfo(data);
+            // 只有在WebSocket未连接时才通过HTTP更新持仓（HTTP是唯一数据源）
+            updatePositions(data.positions || []);
+            await updateManualPlans();
+            
+            // 动态调整刷新频率（只在WebSocket未连接时调整）
+            const hasPositions = (data.positions || []).length > 0;
+            const hasUpcomingTrade = data.has_upcoming_trade || false;
+            
+            // 如果有持仓或临近交易（1分钟内），使用高频刷新（200ms）
+            // 否则使用正常刷新（1秒）
+            const shouldUseHighFreq = hasPositions || hasUpcomingTrade;
+            const newRefreshRate = shouldUseHighFreq ? HIGH_FREQ_RATE : NORMAL_RATE;
+            
+            // 如果刷新频率发生变化，重新设置定时器
+            if (newRefreshRate !== currentRefreshRate) {
+                if (refreshInterval) {
+                    clearInterval(refreshInterval);
+                }
+                currentRefreshRate = newRefreshRate;
+                refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+                console.log(`完整HTTP模式：刷新频率已调整为 ${currentRefreshRate}ms (${shouldUseHighFreq ? '高频模式' : '正常模式'})`);
+            }
+        }
+    } catch (error) {
+        console.error('刷新失败:', error);
+        // 只在出错时显示错误，不要覆盖正常内容
+        const container = document.getElementById('positions-container');
+        if (container && (container.innerHTML.includes('加载中') || container.innerHTML.trim() === '')) {
+            container.innerHTML = '<p class="has-text-danger">刷新失败，请检查网络连接 / Refresh failed, please check network connection</p>';
+        }
+    } finally {
+        isRefreshing = false;
+    }
+}
+
+// 页面加载时开始自动刷新
+document.addEventListener('DOMContentLoaded', function() {
+    updateUTCTime();
+    
+    // 初始化刷新定时器（默认1秒，WebSocket连接后会调整为3秒）
+    if (!refreshInterval) {
+        currentRefreshRate = HTTP_REFRESH_RATE_WS_DISCONNECTED; // 初始使用完整HTTP模式
+        refreshInterval = setInterval(refreshDashboard, currentRefreshRate);
+    }
+    
+    // 立即刷新一次整个Dashboard（包括账户信息、持仓、手动计划表）
+    refreshDashboard();
+    
+    // 加载配置
+    loadSettings();
+    
+    // 尝试连接WebSocket（实时推送持仓和PnL数据）
+    connectWebSocket();
+    
+    // 每1秒更新UTC时间（实时显示，包含秒）
+    setInterval(updateUTCTime, 1000);
+});
+
+// 页面卸载时清理
+window.addEventListener('beforeunload', function() {
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
+    }
+    if (ws) {
+        ws.close();
+    }
+});
+
+// 加载配置
+async function loadSettings() {
+    try {
+        const response = await fetch('/api/settings');
+        const settings = await response.json();
+        
+        // 填充表单
+        document.getElementById('order_type').value = settings.order_type || 'MARKET';
+        document.getElementById('max_slippage_pct').value = settings.max_slippage_pct || 0.5;
+        document.getElementById('limit_order_timeout_seconds').value = settings.limit_order_timeout_seconds || 30;
+        document.getElementById('max_order_amount').value = settings.max_order_amount || '';
+        document.getElementById('leverage').value = settings.leverage || 5;
+        document.getElementById('position_pct').value = settings.position_pct || 0.5;
+        document.getElementById('trailing_exit_pct').value = settings.trailing_exit_pct || 0.15;
+        document.getElementById('stop_loss_pct').value = settings.stop_loss_pct || 0.05;
+        
+        showMessage('配置已加载 / Settings loaded', 'is-success');
+    } catch (error) {
+        console.error('加载配置失败:', error);
+        showMessage('加载配置失败 / Failed to load settings', 'is-danger');
+    }
+}
+
+// 更新配置
+async function updateSettings(event) {
+    event.preventDefault();
+    
+    const form = event.target;
+    const formData = new FormData(form);
+    const data = {};
+    
+    // 收集表单数据
+    for (const [key, value] of formData.entries()) {
+        if (value !== '') {
+            if (key === 'order_type') {
+                data[key] = value;
+            } else if (key === 'max_order_amount') {
+                // 空值或0表示不限制
+                const numValue = parseFloat(value);
+                data[key] = isNaN(numValue) || numValue === 0 ? null : numValue;
+            } else {
+                const numValue = parseFloat(value);
+                if (!isNaN(numValue)) {
+                    data[key] = numValue;
+                }
+            }
+        }
+    }
+    
+    try {
+        const response = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(data)
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            showMessage(result.message + ' ' + (result.warning || ''), 'is-warning');
+            // 更新成功后，立即刷新配置显示（不需要重启服务，因为已更新 os.environ）
+            await loadSettings();
+            // 同时刷新页面以更新手动计划表单的默认值
+            setTimeout(() => {
+                window.location.reload();
+            }, 1000);
+        } else {
+            showMessage(result.message || '更新失败 / Update failed', 'is-danger');
+        }
+    } catch (error) {
+        console.error('更新配置失败:', error);
+        showMessage('更新配置失败 / Failed to update settings', 'is-danger');
+    }
+}
+
+// 显示消息
+function showMessage(message, type) {
+    const messageEl = document.getElementById('settings-message');
+    messageEl.textContent = message;
+    messageEl.className = `notification ${type}`;
+    messageEl.style.display = 'block';
+    
+    // 3秒后自动隐藏
+    setTimeout(() => {
+        messageEl.style.display = 'none';
+    }, 3000);
+}
+
+// 编辑退出参数相关函数
+let currentEditingPositionId = null;
+
+function editExitParams(positionId, symbol, stopLossPct, trailingExitPct) {
+    currentEditingPositionId = positionId;
+    document.getElementById('edit-symbol').value = symbol;
+    document.getElementById('edit-stop-loss-pct').value = (stopLossPct * 100).toFixed(2);
+    document.getElementById('edit-trailing-exit-pct').value = (trailingExitPct * 100).toFixed(2);
+    document.getElementById('edit-exit-params-modal').classList.add('is-active');
+}
+
+function closeEditExitParamsModal() {
+    document.getElementById('edit-exit-params-modal').classList.remove('is-active');
+    currentEditingPositionId = null;
+}
+
+async function saveExitParams() {
+    if (!currentEditingPositionId) {
+        alert('错误：未选择持仓 / Error: No position selected');
+        return;
+    }
+    
+    const stopLossPctInput = document.getElementById('edit-stop-loss-pct');
+    const trailingExitPctInput = document.getElementById('edit-trailing-exit-pct');
+    
+    const stopLossPct = parseFloat(stopLossPctInput.value);
+    const trailingExitPct = parseFloat(trailingExitPctInput.value);
+    
+    // 验证输入
+    if (isNaN(stopLossPct) || stopLossPct < 0 || stopLossPct > 100) {
+        alert('止损百分比必须在0-100之间 / Stop loss percentage must be between 0 and 100');
+        return;
+    }
+    
+    if (isNaN(trailingExitPct) || trailingExitPct < 0 || trailingExitPct > 100) {
+        alert('滑动退出百分比必须在0-100之间 / Trailing exit percentage must be between 0 and 100');
+        return;
+    }
+    
+    // 转换为0-1之间的值
+    const stopLossPctDecimal = stopLossPct / 100;
+    const trailingExitPctDecimal = trailingExitPct / 100;
+    
+    try {
+        const response = await fetch(`/api/positions/${currentEditingPositionId}/exit-params`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                stop_loss_pct: stopLossPctDecimal,
+                trailing_exit_pct: trailingExitPctDecimal,
+            }),
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok && data.success) {
+            alert('退出参数已更新 / Exit parameters updated successfully');
+            closeEditExitParamsModal();
+            // 刷新持仓数据
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // WebSocket会自动更新
+            } else {
+                refreshDashboard();
+            }
+        } else {
+            alert('更新失败 / Update failed: ' + (data.detail || data.message || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('保存退出参数失败:', error);
+        alert('保存失败，请检查网络连接 / Save failed, please check network connection');
+    }
+}
+</script>
+
+<!-- 编辑退出参数模态框 / Edit Exit Parameters Modal -->
+<div class="modal" id="edit-exit-params-modal">
+    <div class="modal-background" onclick="closeEditExitParamsModal()"></div>
+    <div class="modal-card">
+        <header class="modal-card-head">
+            <p class="modal-card-title">编辑退出参数 / Edit Exit Parameters</p>
+            <button class="delete" aria-label="close" onclick="closeEditExitParamsModal()"></button>
+        </header>
+        <section class="modal-card-body">
+            <div class="field">
+                <label class="label">交易对 / Symbol</label>
+                <p class="control">
+                    <input class="input" type="text" id="edit-symbol" readonly>
+                </p>
+            </div>
+            <div class="field">
+                <label class="label">止损百分比 / Stop Loss %</label>
+                <p class="control">
+                    <input class="input" type="number" id="edit-stop-loss-pct" step="0.01" min="0" max="100" placeholder="例如: 5 表示 5%">
+                </p>
+                <p class="help">从入场价下跌的百分比（0-100）</p>
+            </div>
+            <div class="field">
+                <label class="label">滑动退出百分比 / Trailing Exit %</label>
+                <p class="control">
+                    <input class="input" type="number" id="edit-trailing-exit-pct" step="0.01" min="0" max="100" placeholder="例如: 15 表示 15%">
+                </p>
+                <p class="help">从最高价（做多）或最低价（做空）回撤的百分比（0-100）</p>
+            </div>
+        </section>
+        <footer class="modal-card-foot">
+            <button class="button is-success" onclick="saveExitParams()">保存 / Save</button>
+            <button class="button" onclick="closeEditExitParamsModal()">取消 / Cancel</button>
+        </footer>
+    </div>
+</div>
+{% endblock %}
+

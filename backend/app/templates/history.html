@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container" style="margin-top: 2rem;">
+    <div class="card">
+        <header class="card-header">
+            <p class="card-header-title">交易历史记录 / Trading History</p>
+            <div class="card-header-icon">
+                <a href="/" class="button is-small is-light">返回仪表盘 / Back to Dashboard</a>
+            </div>
+        </header>
+        <div class="card-content">
+            <div class="field is-grouped" style="margin-bottom: 1rem;">
+                <div class="control">
+                    <input class="input" type="number" id="limit-input" value="100" min="10" max="1000" step="10">
+                </div>
+                <div class="control">
+                    <button class="button is-primary" onclick="loadHistory()">加载记录 / Load Records</button>
+                </div>
+                <div class="control">
+                    <button class="button is-light" onclick="exportHistory()">导出CSV / Export CSV</button>
+                </div>
+            </div>
+            
+            <div id="history-container">
+                <p>加载中... / Loading...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let historyData = [];
+
+async function loadHistory() {
+    const limit = document.getElementById('limit-input').value || 100;
+    const container = document.getElementById('history-container');
+    
+    try {
+        container.innerHTML = '<p>加载中... / Loading...</p>';
+        const response = await fetch(`/api/history?limit=${limit}`);
+        const data = await response.json();
+        historyData = data.history || [];
+        
+        renderHistory(historyData);
+    } catch (error) {
+        console.error('加载历史记录失败:', error);
+        container.innerHTML = '<p class="has-text-danger">加载失败，请检查网络连接 / Load failed, please check network connection</p>';
+    }
+}
+
+function renderHistory(history) {
+    const container = document.getElementById('history-container');
+    
+    if (history.length === 0) {
+        container.innerHTML = '<p>暂无历史记录 / No history records</p>';
+        return;
+    }
+    
+    let html = '<table class="table is-fullwidth is-striped is-hoverable">';
+    html += '<thead><tr>';
+    html += '<th>时间 / Time</th>';
+    html += '<th>类型 / Type</th>';
+    html += '<th>交易对 / Symbol</th>';
+    html += '<th>方向 / Side</th>';
+    html += '<th>入场价 / Entry</th>';
+    html += '<th>退出价 / Exit</th>';
+    html += '<th>数量 / Quantity</th>';
+    html += '<th>杠杆 / Leverage</th>';
+    html += '<th>退出原因 / Exit Reason</th>';
+    html += '<th>止损% / Stop Loss %</th>';
+    html += '<th>滑动退出% / Trailing %</th>';
+    html += '<th>最高/最低 / High/Low</th>';
+    html += '<th>盈亏% / P&L %</th>';
+    html += '<th>订单ID / Order ID</th>';
+    html += '</tr></thead><tbody>';
+    
+    history.forEach(item => {
+        const isPosition = item.type === 'position';
+        const timestamp = item.timestamp || item.exit_time || item.entry_time || item.created_at || 'N/A';
+        
+        // 安全解析时间
+        let timeStr = 'N/A';
+        if (timestamp && timestamp !== 'N/A') {
+            try {
+                const date = new Date(timestamp);
+                if (!isNaN(date.getTime())) {
+                    timeStr = date.toLocaleString('zh-CN', { timeZone: 'UTC' }) + ' UTC';
+                }
+            } catch (e) {
+                timeStr = String(timestamp);
+            }
+        }
+        
+        // 退出原因翻译
+        const exitReasonMap = {
+            'stop_loss': '止损 / Stop Loss',
+            'trailing_stop': '滑动退出 / Trailing Stop',
+            'external_closed': '外部关闭 / External Closed',
+            'manual': '手动 / Manual',
+        };
+        const exitReason = exitReasonMap[item.exit_reason] || item.exit_reason || '-';
+        
+        // 盈亏颜色
+        const pnlPct = item.pnl_pct;
+        const pnlClass = pnlPct !== null && pnlPct !== undefined ? (pnlPct >= 0 ? 'has-text-success' : 'has-text-danger') : '';
+        const pnlText = pnlPct !== null && pnlPct !== undefined ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%` : '-';
+        
+        // 安全格式化数字
+        const formatNum = (val, decimals = 4) => {
+            if (val === null || val === undefined) return '-';
+            const num = typeof val === 'number' ? val : parseFloat(val);
+            return isNaN(num) ? '-' : num.toFixed(decimals);
+        };
+        
+        html += '<tr>';
+        html += `<td>${timeStr}</td>`;
+        html += `<td><span class="tag ${isPosition ? 'is-info' : 'is-light'}">${isPosition ? '持仓 / Position' : '执行日志 / Execution Log'}</span></td>`;
+        html += `<td><strong>${item.symbol || '-'}</strong></td>`;
+        html += `<td><span class="tag ${item.side === 'BUY' ? 'is-success' : 'is-danger'}">${item.side || '-'}</span></td>`;
+        html += `<td>${formatNum(item.entry_price)}</td>`;
+        html += `<td>${formatNum(item.exit_price)}</td>`;
+        html += `<td>${formatNum(item.entry_quantity || item.quantity)}</td>`;
+        html += `<td>${item.leverage ? formatNum(item.leverage, 0) + 'x' : '-'}</td>`;
+        html += `<td>${exitReason}</td>`;
+        html += `<td>${item.stop_loss_pct !== null && item.stop_loss_pct !== undefined ? formatNum(item.stop_loss_pct * 100, 2) + '%' : '-'}</td>`;
+        html += `<td>${item.trailing_exit_pct !== null && item.trailing_exit_pct !== undefined ? formatNum(item.trailing_exit_pct * 100, 2) + '%' : '-'}</td>`;
+        html += `<td>${item.highest_price && item.lowest_price ? `${formatNum(item.highest_price)}/${formatNum(item.lowest_price)}` : '-'}</td>`;
+        html += `<td class="${pnlClass}"><strong>${pnlText}</strong></td>`;
+        html += `<td><code style="font-size: 0.75rem;">${item.order_id || '-'}</code></td>`;
+        html += '</tr>';
+    });
+    
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function exportHistory() {
+    if (historyData.length === 0) {
+        alert('请先加载历史记录 / Please load history first');
+        return;
+    }
+    
+    // 构建CSV内容
+    let csv = '时间,类型,交易对,方向,入场价,退出价,数量,杠杆,退出原因,止损%,滑动退出%,最高价,最低价,盈亏%,订单ID\n';
+    
+    historyData.forEach(item => {
+        const timestamp = item.timestamp || item.exit_time || item.entry_time || '';
+        const exitReasonMap = {
+            'stop_loss': '止损',
+            'trailing_stop': '滑动退出',
+            'external_closed': '外部关闭',
+            'manual': '手动',
+        };
+        const exitReason = exitReasonMap[item.exit_reason] || item.exit_reason || '';
+        
+        csv += [
+            timestamp,
+            item.type === 'position' ? '持仓' : '执行日志',
+            item.symbol || '',
+            item.side || '',
+            item.entry_price || '',
+            item.exit_price || '',
+            item.entry_quantity || item.quantity || '',
+            item.leverage || '',
+            exitReason,
+            item.stop_loss_pct ? (item.stop_loss_pct * 100).toFixed(2) : '',
+            item.trailing_exit_pct ? (item.trailing_exit_pct * 100).toFixed(2) : '',
+            item.highest_price || '',
+            item.lowest_price || '',
+            item.pnl_pct !== null ? item.pnl_pct.toFixed(2) : '',
+            item.order_id || '',
+        ].join(',') + '\n';
+    });
+    
+    // 下载CSV文件
+    const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `trading_history_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// 页面加载时自动加载历史记录
+document.addEventListener('DOMContentLoaded', function() {
+    loadHistory();
+});
+</script>
+{% endblock %}
+

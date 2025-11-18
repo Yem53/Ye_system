@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ settings.app_name }}</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+    <style>
+        body { padding: 20px; }
+        .card + .card { margin-top: 1rem; }
+        .scroll-box { max-height: 360px; overflow-y: auto; }
+        
+        /* 方案3：CSS过渡平滑更新 - 持仓表格平滑过渡 */
+        #positions-container table tbody tr {
+            transition: background-color 0.4s ease, opacity 0.3s ease, transform 0.2s ease;
+            will-change: opacity, background-color;
+        }
+        
+        /* 单元格内容更新时平滑过渡 */
+        #positions-container table td {
+            transition: color 0.3s ease, background-color 0.3s ease, opacity 0.2s ease;
+            will-change: color, opacity;
+        }
+        
+        /* 防止表格闪烁 - 保持最小高度，添加淡入淡出效果 */
+        #positions-container {
+            min-height: 100px;
+            transition: opacity 0.3s ease-in-out;
+            will-change: opacity;
+        }
+        
+        /* 表格容器淡入淡出效果 */
+        #positions-container table {
+            opacity: 1;
+            transition: opacity 0.3s ease-in-out;
+            will-change: opacity;
+        }
+        
+        /* PnL数字平滑更新 */
+        #total-pnl {
+            transition: color 0.4s ease, opacity 0.3s ease;
+            will-change: color, opacity;
+        }
+        
+        /* 余额数字平滑更新 */
+        #wallet-balance, #spot-balance, #futures-balance {
+            transition: opacity 0.3s ease;
+            will-change: opacity;
+        }
+        
+        /* 防止布局抖动 - 固定表格布局 */
+        #positions-container table {
+            table-layout: fixed;
+            width: 100%;
+        }
+        
+        /* 单元格内容更新时不闪烁 */
+        #positions-container table td strong {
+            display: inline-block;
+            min-width: 1em;
+            transition: color 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+<section class="section">
+    <div class="container">
+        <h1 class="title">{{ settings.app_name }}</h1>
+        {% block content %}{% endblock %}
+    </div>
+</section>
+</body>
+</html>
