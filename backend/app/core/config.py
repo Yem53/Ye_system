@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     max_position_concentration_pct: float = Field(0.5, env="MAX_POSITION_CONCENTRATION_PCT", description="单一标的最大仓位占比，默认50%")
     max_total_leverage: int = Field(10, env="MAX_TOTAL_LEVERAGE", description="全局最大杠杆倍数，默认10x")
 
+    # 持仓管理配置
+    auto_merge_duplicate_positions: bool = Field(False, env="AUTO_MERGE_DUPLICATE_POSITIONS", description="是否自动合并重复持仓（同一交易对、同一方向）。False=保留所有持仓（支持分批建仓），True=自动合并（简化管理）")
+    verify_external_position_close: bool = Field(True, env="VERIFY_EXTERNAL_POSITION_CLOSE", description="关闭外部持仓前是否二次确认。True=二次确认（更安全），False=直接关闭（更快）")
+
     alpha_feed_url: HttpUrl | str = Field(
         "https://www.binance.com/bapi/apex/v1/public/apex/announcement/getLatestList",
         description="币安 Alpha 公告接口地址",

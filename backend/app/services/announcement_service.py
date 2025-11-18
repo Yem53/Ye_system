@@ -206,12 +206,39 @@ class AnnouncementFetcher:
         return normalized
 
     def _extract_symbol(self, title: str, content: str) -> str | None:
-        candidates = re.findall(r"([A-Z]{3,10})USDT", title.upper() + content.upper())
-        if candidates:
-            return candidates[0]
-        match = re.search(r"\(([A-Z0-9]{3,10})\)", title)
+        """提取交易对符号（优化版：添加词边界和黑名单过滤）
+
+        Args:
+            title: 公告标题
+            content: 公告内容
+
+        Returns:
+            str | None: 提取的交易对符号（如 "BTC"）或 None
+        """
+        # 常见误报词黑名单（避免匹配到非交易对的词）
+        BLACKLIST = {
+            "NEW", "THE", "FOR", "AND", "NOT", "BUT", "FROM", "WITH", "THIS",
+            "THAT", "WILL", "HAVE", "MORE", "WHEN", "MAKE", "LIKE", "TIME",
+            "UPDATE", "LISTED", "BINANCE", "TRADING", "FUTURES", "SPOT",
+            "PERPETUAL", "LAUNCH", "ANNOUNCEMENT", "ALPHA", "LISTED"
+        }
+
+        # 优先匹配 "XXXUSDT" 格式（添加词边界 \b 避免误匹配）
+        text = title.upper() + " " + content.upper()
+        candidates = re.findall(r'\b([A-Z]{3,10})USDT\b', text)
+
+        # 过滤黑名单词
+        valid_candidates = [c for c in candidates if c not in BLACKLIST]
+        if valid_candidates:
+            return valid_candidates[0]
+
+        # 备用：匹配括号中的符号 (XXX)
+        match = re.search(r'\(([A-Z0-9]{3,10})\)', title)
         if match:
-            return match.group(1)
+            symbol = match.group(1)
+            if symbol not in BLACKLIST:
+                return symbol
+
         return None
 
     def _safe_parse_time(self, value: str | int | None) -> datetime | None:

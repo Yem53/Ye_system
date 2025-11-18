@@ -52,22 +52,31 @@ class BinanceFuturesClient:
                 del cls._price_cache[symbol]
                 logger.debug("已清除 {} 价格缓存", symbol)
 
+    def _get_proxies(self) -> dict[str, str] | None:
+        """获取代理配置（统一方法，避免重复代码）
+
+        Returns:
+            dict | None: 代理配置字典 {"http": "...", "https": "..."} 或 None
+        """
+        if self.settings.http_proxy or self.settings.https_proxy:
+            return {
+                "http": self.settings.http_proxy or self.settings.https_proxy,
+                "https": self.settings.https_proxy or self.settings.http_proxy,
+            }
+        return None
+
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
         # 配置代理（如果设置了 HTTP_PROXY，支持 Clash 等 VPN 代理）
-        proxies = None
-        if self.settings.http_proxy or self.settings.https_proxy:
-            proxies = {
-                "http": self.settings.http_proxy or self.settings.https_proxy,
-                "https": self.settings.https_proxy or self.settings.http_proxy,
-            }
+        proxies = self._get_proxies()
+        if proxies:
             # 只在首次初始化时记录代理信息，避免重复日志
             if not hasattr(BinanceFuturesClient, '_proxy_logged'):
                 proxy_info = f"HTTP: {self.settings.http_proxy or '未设置'}, HTTPS: {self.settings.https_proxy or '未设置'}"
                 logger.info("使用代理: {}", proxy_info)
                 BinanceFuturesClient._proxy_logged = True
-        
+
         # 使用 Client 类，通过 base_endpoint 参数指定合约交易端点
         # 注意：禁用 ping 以避免初始化时的网络请求
         self.client = Client(
@@ -76,7 +85,7 @@ class BinanceFuturesClient:
             base_endpoint="https://fapi.binance.com",  # 币安合约交易 API 端点
             ping=False,  # 禁用初始化时的 ping，避免网络错误
         )
-        
+
         # 如果设置了代理，配置 requests session 的代理
         # binance 库内部使用 requests，需要手动设置 session 的代理
         if proxies:
@@ -97,15 +106,7 @@ class BinanceFuturesClient:
             
             # 获取交易对信息（不需要签名）
             url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -167,15 +168,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -215,15 +208,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
@@ -262,16 +247,7 @@ class BinanceFuturesClient:
         headers = {
             "X-MBX-APIKEY": self.settings.binance_api_key
         }
-        
-        # 使用代理
-        proxies = None
-        if self.settings.http_proxy or self.settings.https_proxy:
-            proxies = {
-                "http": self.settings.http_proxy or self.settings.https_proxy,
-                "https": self.settings.https_proxy or self.settings.http_proxy,
-            }
-        
-        response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+        response = requests.get(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
         
         # 检查响应
         if response.status_code == 401:
@@ -282,29 +258,36 @@ class BinanceFuturesClient:
         response.raise_for_status()
         return response.json()
 
-    def get_futures_balance(self) -> Decimal:
-        """获取合约账户可用余额（availableBalance，带缓存）"""
+    def get_futures_balance(self, fallback_to_cache: bool = False) -> Decimal:
+        """获取合约账户可用余额（availableBalance，带缓存）
+
+        Args:
+            fallback_to_cache: API失败时是否降级到缓存值（默认False）
+
+        Returns:
+            Decimal: 可用余额（USDT）
+        """
         # 检查缓存
         with BinanceFuturesClient._cache_lock:
             if "futures" in BinanceFuturesClient._balance_cache:
                 value, timestamp = BinanceFuturesClient._balance_cache["futures"]
                 if time.time() - timestamp < self.settings.balance_cache_ttl:
                     return Decimal(str(value))
-        
+
         try:
             # 检查API密钥是否配置
             if not self.settings.binance_api_key or not self.settings.binance_api_secret:
                 logger.warning("币安API密钥未配置，无法获取账户余额")
                 raise ValueError("API密钥未配置")
-            
+
             # 获取合约账户余额
             url = "https://fapi.binance.com/fapi/v2/balance"
             account = self._make_signed_request(url)
-            
+
             if not account or not isinstance(account, list):
                 logger.error("获取合约账户余额返回格式错误: {}", type(account))
                 raise ValueError("合约账户余额API返回格式错误")
-            
+
             total = Decimal("0")
             for item in account:
                 if item.get("asset") == "USDT":
@@ -312,14 +295,26 @@ class BinanceFuturesClient:
                     balance_str = item.get("availableBalance", item.get("balance", "0"))
                     total = Decimal(str(balance_str))
                     break
-            
+
             # 更新缓存
             with BinanceFuturesClient._cache_lock:
                 BinanceFuturesClient._balance_cache["futures"] = (float(total), time.time())
-            
+
             return total
         except Exception as exc:
             logger.error("获取合约账户余额失败: {} (类型: {})", exc, type(exc).__name__)
+
+            # 降级策略：使用缓存值（如果允许）
+            if fallback_to_cache:
+                with BinanceFuturesClient._cache_lock:
+                    if "futures" in BinanceFuturesClient._balance_cache:
+                        value, timestamp = BinanceFuturesClient._balance_cache["futures"]
+                        age = time.time() - timestamp
+                        logger.warning("API失败，使用缓存余额（可能过期）: {} USDT (缓存时间: {:.1f}秒前)",
+                                     value, age)
+                        return Decimal(str(value))
+
+            # 没有缓存或不允许降级，抛出异常
             raise
 
     def get_futures_wallet_balance(self) -> Decimal:
@@ -427,15 +422,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
@@ -489,15 +476,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
@@ -542,15 +521,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
@@ -601,16 +572,9 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
+
             # sapi 使用 POST 方法
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
@@ -807,15 +771,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code != 200:
                 try:
@@ -910,15 +866,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.post(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code != 200:
                 try:
@@ -984,15 +932,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             
             if response.status_code != 200:
                 try:
@@ -1039,15 +979,7 @@ class BinanceFuturesClient:
             import requests
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
             params = {"symbol": symbol}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params=params, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             response.raise_for_status()
             data = response.json()
             price = Decimal(data.get("markPrice", "0"))
@@ -1074,15 +1006,7 @@ class BinanceFuturesClient:
             # 直接使用 requests 获取所有标记价格（避免 python-binance 库的 URL 拼接问题）
             import requests
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params={}, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params={}, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -1178,15 +1102,7 @@ class BinanceFuturesClient:
             
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = requests.get(url, params=params, headers=headers, proxies=self._get_proxies(), timeout=self.settings.binance_http_timeout)
             response.raise_for_status()
             data = response.json()
             

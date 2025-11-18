@@ -60,39 +60,42 @@ class PositionService:
                 logger.error("监控持仓 %s 时出错: %s", position.id, exc, exc_info=True)
 
     def _check_position(self, position: Position) -> None:
-        """检查单个持仓，执行退出策略"""
+        """检查单个持仓，执行退出策略
+
+        退出策略优先级：
+        1. 止损 (Stop Loss) - 亏损达到阈值时强制退出
+        2. 滑动止损 (Trailing Stop) - 价格从最高点回撤时退出
+
+        逻辑说明：
+        - 先更新历史最高/最低价（追踪价格极值）
+        - 再检查止损条件（防止大幅亏损）
+        - 最后检查滑动止损（锁定利润）
+        """
         # 获取当前价格
         current_price = self.client.get_mark_price(position.symbol)
         if not current_price:
             logger.warning("无法获取 %s 的标记价格", position.symbol)
             return
-        
+
         current_price = Decimal(str(current_price))
         now = datetime.now(timezone.utc)
-        
-        # 重要：在更新最高价/最低价之前，先保存用于滑动退出计算的基准价格
-        # 这样可以确保滑动退出检查使用的是更新前的历史最高/最低价，避免逻辑错误
-        highest_for_trailing = position.highest_price
-        lowest_for_trailing = position.lowest_price
-        
-        # 更新最高价和最低价（持续追踪，用于滑动退出）
-        # 重要：这些值会持续更新，即使trailing_exit_pct被修改，也会继续使用历史最高/最低价
-        price_changed = False
+
+        # 步骤1: 更新历史最高价和最低价（用于滑动止损）
+        # 注意：即使退出参数被修改，历史价格仍然持续追踪
         if position.highest_price is None or current_price > position.highest_price:
             old_highest = position.highest_price
             position.highest_price = current_price
-            price_changed = True
             if old_highest is not None:
-                logger.debug("持仓 %s (%s) 更新历史最高价: %s -> %s (用于滑动退出计算)", 
+                logger.debug("持仓 %s (%s) 更新历史最高价: %s -> %s",
                            position.id, position.symbol, old_highest, current_price)
+
         if position.lowest_price is None or current_price < position.lowest_price:
             old_lowest = position.lowest_price
             position.lowest_price = current_price
-            price_changed = True
             if old_lowest is not None:
-                logger.debug("持仓 %s (%s) 更新历史最低价: %s -> %s (用于滑动退出计算)", 
+                logger.debug("持仓 %s (%s) 更新历史最低价: %s -> %s",
                            position.id, position.symbol, old_lowest, current_price)
-        
+
         position.last_check_time = now
         
         # 计算当前盈亏（用于日志和监控）
@@ -135,53 +138,44 @@ class PositionService:
                            position.id, position.symbol, current_price, stop_loss_price,
                            pnl_pct, pnl_value, float(position.stop_loss_pct) * 100)
         
-        # 检查滑动退出（仅对做多有效）
-        # 重要：使用更新前的历史最高价计算滑动止损价，避免在本次检查中更新最高价后立即触发
-        if position.side == "BUY" and highest_for_trailing:
-            # 基于历史最高价和当前滑动退出百分比计算退出价格
-            trailing_stop_price = highest_for_trailing * (Decimal("1") - Decimal(str(position.trailing_exit_pct)))
-            # 重要：只有当当前价格严格小于等于滑动止损价时才触发（避免浮点数精度问题）
+        # 步骤3: 检查滑动止损（Trailing Stop）
+        # 做多(BUY): 价格从最高点回撤超过阈值时退出
+        if position.side == "BUY" and position.highest_price:
+            trailing_stop_price = position.highest_price * (Decimal("1") - Decimal(str(position.trailing_exit_pct)))
             if current_price <= trailing_stop_price:
-                logger.info("持仓 %s (%s) 触发滑动退出: 当前价 %s <= 滑动止损价 %s (历史最高价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
-                          position.id, position.symbol, current_price, trailing_stop_price, highest_for_trailing,
-                          float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
+                logger.info("持仓 %s (%s) 触发滑动止损: 当前价 %s <= 止损价 %s (最高价: %s, 回撤: %s%%, 盈亏: %.2f%%)",
+                          position.id, position.symbol, current_price, trailing_stop_price, position.highest_price,
+                          float(position.trailing_exit_pct) * 100, pnl_pct)
                 try:
-                    self._close_position(position, current_price, "trailing_stop")  # 使用当前价格而不是计算出的止损价
+                    self._close_position(position, current_price, "trailing_stop")
                     return
                 except Exception as exc:
-                    logger.error("滑动退出执行失败: 持仓 %s (%s), 错误: %s", position.id, position.symbol, exc, exc_info=True)
-                    # 不返回，继续监控，等待下次检查时重试
+                    logger.error("滑动止损执行失败: 持仓 %s (%s), 错误: %s", position.id, position.symbol, exc, exc_info=True)
                     self.db.rollback()
                     return
             else:
-                # 调试日志：显示滑动退出状态（每10次检查记录一次，避免日志过多）
-                logger.debug("持仓 %s (%s) 滑动退出监控: 当前价=%s, 历史最高价=%s, 滑动止损价=%s, 滑动退出百分比=%s%%, 当前盈亏=%.2f%% (%.2f USDT)", 
-                           position.id, position.symbol, current_price, highest_for_trailing, trailing_stop_price,
-                           float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
-        
-        # 对做空的处理（反转逻辑）
-        # 重要：使用更新前的历史最低价计算滑动止损价，避免在本次检查中更新最低价后立即触发
-        if position.side == "SELL" and lowest_for_trailing:
-            # 基于历史最低价和当前滑动退出百分比计算退出价格
-            trailing_stop_price = lowest_for_trailing * (Decimal("1") + Decimal(str(position.trailing_exit_pct)))
-            # 重要：只有当当前价格严格大于等于滑动止损价时才触发（避免浮点数精度问题）
+                logger.debug("持仓 %s (%s) 滑动止损监控: 价格=%s, 最高=%s, 止损价=%s, 盈亏=%.2f%%",
+                           position.id, position.symbol, current_price, position.highest_price,
+                           trailing_stop_price, pnl_pct)
+
+        # 做空(SELL): 价格从最低点反弹超过阈值时退出
+        elif position.side == "SELL" and position.lowest_price:
+            trailing_stop_price = position.lowest_price * (Decimal("1") + Decimal(str(position.trailing_exit_pct)))
             if current_price >= trailing_stop_price:
-                logger.info("持仓 %s (%s) 触发滑动退出: 当前价 %s >= 滑动止损价 %s (历史最低价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
-                          position.id, position.symbol, current_price, trailing_stop_price, lowest_for_trailing,
-                          float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
+                logger.info("持仓 %s (%s) 触发滑动止损: 当前价 %s >= 止损价 %s (最低价: %s, 反弹: %s%%, 盈亏: %.2f%%)",
+                          position.id, position.symbol, current_price, trailing_stop_price, position.lowest_price,
+                          float(position.trailing_exit_pct) * 100, pnl_pct)
                 try:
-                    self._close_position(position, current_price, "trailing_stop")  # 使用当前价格而不是计算出的止损价
+                    self._close_position(position, current_price, "trailing_stop")
                     return
                 except Exception as exc:
-                    logger.error("滑动退出执行失败: 持仓 %s (%s), 错误: %s", position.id, position.symbol, exc, exc_info=True)
-                    # 不返回，继续监控，等待下次检查时重试
+                    logger.error("滑动止损执行失败: 持仓 %s (%s), 错误: %s", position.id, position.symbol, exc, exc_info=True)
                     self.db.rollback()
                     return
             else:
-                # 调试日志：显示滑动退出状态
-                logger.debug("持仓 %s (%s) 滑动退出监控: 当前价=%s, 历史最低价=%s, 滑动止损价=%s, 滑动退出百分比=%s%%, 当前盈亏=%.2f%% (%.2f USDT)", 
-                           position.id, position.symbol, current_price, lowest_for_trailing, trailing_stop_price,
-                           float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
+                logger.debug("持仓 %s (%s) 滑动止损监控: 价格=%s, 最低=%s, 止损价=%s, 盈亏=%.2f%%",
+                           position.id, position.symbol, current_price, position.lowest_price,
+                           trailing_stop_price, pnl_pct)
         
         self.db.commit()
 
@@ -273,73 +267,65 @@ class PositionService:
             
             logger.info("平仓订单已提交: 订单ID=%s, 状态=%s, 结果=%s", order_id, order_status, result)
             
-            # 重要：等待订单成交（市价单通常立即成交，但需要确认）
-            # 市价单可能初始返回NEW状态，需要等待并查询
+            # 等待订单成交（使用指数退避策略）
+            # 市价单通常立即成交，但可能需要短暂等待
             import time
-            max_retries = 15  # 增加重试次数（15次 * 0.5秒 = 7.5秒）
-            retry_count = 0
             order_filled = False
-            
+
             # 如果初始状态已经是FILLED，直接处理
             if order_status in ["FILLED", "COMPLETED"]:
                 order_filled = True
                 logger.info("订单立即成交: 订单ID=%s", order_id)
             else:
-                # 等待订单成交（市价单通常很快成交）
-                # 先等待0.2秒，让订单有时间成交
-                time.sleep(0.2)
-                
-                while retry_count < max_retries:
+                # 指数退避策略：0.1s → 0.2s → 0.5s → 1s → 2s → 3s
+                # 总等待时间约7秒，但快速成交的订单几乎不等待
+                backoff_delays = [0.1, 0.2, 0.5, 1.0, 2.0, 3.0]
+                retry_count = 0
+
+                for delay in backoff_delays:
+                    time.sleep(delay)
+                    retry_count += 1
+
                     try:
                         order_info = self.client.get_order_status(position.symbol, order_id)
                         order_status = order_info.get("status", order_status)
-                        logger.debug("查询订单状态: 订单ID=%s, 状态=%s (重试 %d/%d)", 
-                                   order_id, order_status, retry_count + 1, max_retries)
-                        
+                        logger.debug("查询订单状态: 订单ID=%s, 状态=%s (第%d次, 等待%.1fs)",
+                                   order_id, order_status, retry_count, delay)
+
                         if order_status in ["FILLED", "COMPLETED"]:
-                            # 订单已成交，更新实际成交价格和数量
+                            # 订单已成交
                             actual_price = order_info.get("avgPrice") or order_info.get("price") or exit_price
                             actual_quantity = order_info.get("executedQty") or order_info.get("quantity") or position.entry_quantity
                             exit_price = Decimal(str(actual_price))
                             position.exit_quantity = Decimal(str(actual_quantity))
-                            logger.info("订单已成交: 订单ID=%s, 成交价=%s, 成交数量=%s", 
-                                       order_id, exit_price, position.exit_quantity)
+                            logger.info("订单已成交: 订单ID=%s, 成交价=%s, 成交数量=%s (耗时~%.1fs)",
+                                       order_id, exit_price, position.exit_quantity, sum(backoff_delays[:retry_count]))
                             order_filled = True
                             break
                         elif order_status in ["CANCELED", "REJECTED", "EXPIRED"]:
                             error_msg = f"订单被取消或拒绝: 状态={order_status}, 订单ID={order_id}"
                             logger.error(error_msg)
                             raise ValueError(error_msg)
-                        elif order_status == "NEW":
-                            # 订单还是新状态，继续等待
-                            logger.debug("订单仍为新状态，继续等待: 订单ID=%s", order_id)
+                        elif order_status in ["NEW", "PARTIALLY_FILLED"]:
+                            # 继续等待
+                            logger.debug("订单状态=%s, 继续等待: 订单ID=%s", order_status, order_id)
                         else:
-                            # 其他状态（如PARTIALLY_FILLED），继续等待
-                            logger.debug("订单状态: %s, 继续等待: 订单ID=%s", order_status, order_id)
-                            
+                            logger.warning("订单未知状态=%s: 订单ID=%s", order_status, order_id)
+
                     except Exception as exc:
-                        logger.warning("查询订单状态失败: %s (重试 %d/%d)", exc, retry_count + 1, max_retries)
-                        # 查询失败时，如果是最后一次重试，尝试从原始结果获取信息
-                        if retry_count == max_retries - 1:
-                            # 最后一次重试失败，检查原始结果中是否有成交信息
+                        logger.warning("查询订单状态失败: %s (第%d次)", exc, retry_count)
+                        # 最后一次查询失败时，尝试使用原始结果
+                        if retry_count == len(backoff_delays):
                             if result.get("executedQty") and float(result.get("executedQty", 0)) > 0:
-                                # 原始结果中有成交数量，说明订单可能已成交
-                                logger.warning("订单状态查询失败，但原始结果显示有成交: 订单ID=%s, 成交数量=%s", 
+                                logger.warning("使用原始结果: 订单ID=%s, 成交数量=%s",
                                              order_id, result.get("executedQty"))
-                                # 尝试使用原始结果
                                 actual_price = result.get("avgPrice") or result.get("price") or exit_price
                                 actual_quantity = result.get("executedQty") or position.entry_quantity
                                 if actual_price and actual_quantity:
                                     exit_price = Decimal(str(actual_price))
                                     position.exit_quantity = Decimal(str(actual_quantity))
                                     order_filled = True
-                                    logger.info("使用原始结果: 订单ID=%s, 成交价=%s, 成交数量=%s", 
-                                             order_id, exit_price, position.exit_quantity)
                                     break
-                    
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        time.sleep(0.5)  # 等待0.5秒后重试
             
             # 检查订单是否成交
             if not order_filled:
@@ -456,57 +442,62 @@ class PositionService:
             # 获取数据库中所有活跃持仓（包括系统和非系统的）
             all_active_positions = self.get_active_positions()
             
-            # 检查是否有重复的 (symbol, side) 持仓
-            # 如果有重复，需要合并或关闭多余的持仓
+            # 检查重复持仓（同一交易对、同一方向的多个活跃持仓）
+            # 根据配置决定是否自动合并
             position_groups = {}
             for pos in all_active_positions:
                 key = (pos.symbol, pos.side)
                 if key not in position_groups:
                     position_groups[key] = []
                 position_groups[key].append(pos)
-            
-            # 处理重复持仓：保留最新的或用户修改过的，关闭其他的
-            for key, positions in position_groups.items():
-                if len(positions) > 1:
-                    logger.warning("检测到重复持仓: {} {} 有 {} 个活跃持仓，将合并为一个", 
-                                 key[0], key[1], len(positions))
-                    
-                    # 选择要保留的持仓：
-                    # 1. 优先保留有用户自定义退出参数的（trailing_exit_pct 或 stop_loss_pct 不等于默认值）
-                    # 2. 如果没有，保留最新的（entry_time 最晚的）
-                    settings = self.settings
-                    default_trailing = Decimal(str(settings.trailing_exit_pct))
-                    default_stop_loss = Decimal(str(settings.stop_loss_pct))
-                    
-                    # 找出有自定义参数的持仓
-                    custom_positions = [p for p in positions 
-                                      if p.trailing_exit_pct != default_trailing or 
-                                         p.stop_loss_pct != default_stop_loss]
-                    
-                    if custom_positions:
-                        # 保留有自定义参数的持仓（如果有多个，保留最新的）
-                        keep_position = max(custom_positions, key=lambda p: p.entry_time)
-                        logger.info("保留持仓 {} (有自定义退出参数: 滑动退出={}%%, 止损={}%%)", 
-                                  keep_position.id,
-                                  float(keep_position.trailing_exit_pct) * 100,
-                                  float(keep_position.stop_loss_pct) * 100)
-                    else:
-                        # 保留最新的持仓
-                        keep_position = max(positions, key=lambda p: p.entry_time)
-                        logger.info("保留持仓 {} (最新创建)", keep_position.id)
-                    
-                    # 关闭其他重复的持仓
-                    for pos in positions:
-                        if pos.id != keep_position.id:
-                            logger.info("关闭重复持仓 {} (与持仓 {} 重复)", pos.id, keep_position.id)
-                            pos.status = PositionStatus.CLOSED
-                            pos.exit_time = datetime.now(timezone.utc)
-                            pos.exit_reason = "duplicate_merged"  # 标记为重复合并
-            
-            # 如果有重复持仓被关闭，先提交更改
-            if any(len(positions) > 1 for positions in position_groups.values()):
-                self.db.commit()
-                logger.info("已关闭重复持仓，重新获取活跃持仓列表")
+
+            # 处理重复持仓
+            duplicates_found = any(len(positions) > 1 for positions in position_groups.values())
+            if duplicates_found:
+                if self.settings.auto_merge_duplicate_positions:
+                    # 自动合并模式：保留最重要的持仓，关闭其他
+                    logger.info("检测到重复持仓，启用自动合并模式")
+                    for key, positions in position_groups.items():
+                        if len(positions) > 1:
+                            logger.warning("重复持仓: {} {} 有 {} 个活跃持仓，将合并",
+                                         key[0], key[1], len(positions))
+
+                            # 选择保留策略：
+                            # 1. 优先保留有用户自定义退出参数的
+                            # 2. 否则保留最新的
+                            default_trailing = Decimal(str(self.settings.trailing_exit_pct))
+                            default_stop_loss = Decimal(str(self.settings.stop_loss_pct))
+
+                            custom_positions = [p for p in positions
+                                              if p.trailing_exit_pct != default_trailing or
+                                                 p.stop_loss_pct != default_stop_loss]
+
+                            if custom_positions:
+                                keep_position = max(custom_positions, key=lambda p: p.entry_time)
+                                logger.info("保留持仓 {} (有自定义参数)", keep_position.id)
+                            else:
+                                keep_position = max(positions, key=lambda p: p.entry_time)
+                                logger.info("保留持仓 {} (最新)", keep_position.id)
+
+                            # 关闭其他持仓
+                            for pos in positions:
+                                if pos.id != keep_position.id:
+                                    logger.info("关闭重复持仓 {} (合并到 {})", pos.id, keep_position.id)
+                                    pos.status = PositionStatus.CLOSED
+                                    pos.exit_time = datetime.now(timezone.utc)
+                                    pos.exit_reason = "duplicate_merged"
+
+                    self.db.commit()
+                    logger.info("重复持仓合并完成")
+                else:
+                    # 保留所有持仓，仅记录警告（支持分批建仓策略）
+                    for key, positions in position_groups.items():
+                        if len(positions) > 1:
+                            logger.warning("检测到重复持仓: {} {} 有 {} 个活跃持仓（配置为不合并，可能是分批建仓）",
+                                         key[0], key[1], len(positions))
+                            for pos in positions:
+                                logger.debug("  - 持仓ID: {}, 入场价: {}, 数量: {}",
+                                           pos.id, pos.entry_price, pos.entry_quantity)
             
             # 重新获取活跃持仓（排除已关闭的重复持仓）
             db_positions = {
@@ -636,49 +627,52 @@ class PositionService:
                               float(initial_high_low))
             
             # 检查币安上已关闭的持仓（数据库中有但币安上没有）
-            # 需要更谨慎：只有在确认币安API调用成功且返回了完整数据时才关闭
             closed_count = 0
             for key, position in db_positions.items():
-                if key not in binance_keys:
-                    # 币安上可能已关闭，但需要二次确认以避免误关闭
-                    if position.status == PositionStatus.ACTIVE:
-                        # 添加日志，记录即将关闭的持仓信息
-                        logger.info("检测到持仓可能在币安上已关闭: {} {} (持仓ID: {})，进行二次确认", 
+                if key not in binance_keys and position.status == PositionStatus.ACTIVE:
+                    # 持仓可能已在币安上关闭
+                    # 根据配置和持仓类型决定是否需要二次确认
+                    need_verification = (
+                        self.settings.verify_external_position_close and
+                        getattr(position, 'is_external', False)
+                    )
+
+                    if need_verification:
+                        # 外部持仓需要二次确认（更安全）
+                        logger.info("检测到外部持仓可能已关闭: {} {} (ID: {})，进行二次确认",
                                   position.symbol, position.side, position.id)
-                        
-                        # 二次确认：再次查询币安API，确认该持仓确实不存在
-                        # 如果确认不存在，才标记为关闭
                         try:
-                            # 重新获取该交易对的持仓信息
                             all_positions = self.client.get_positions_from_binance()
                             if all_positions is not None:
-                                # 检查该持仓是否真的不存在
-                                found = False
-                                for bp in all_positions:
-                                    if bp["symbol"] == position.symbol and bp["side"] == position.side:
-                                        found = True
-                                        logger.debug("二次确认：持仓 {} {} 在币安上仍存在，保持ACTIVE状态", 
-                                                   position.symbol, position.side)
-                                        break
-                                
+                                found = any(
+                                    bp["symbol"] == position.symbol and bp["side"] == position.side
+                                    for bp in all_positions
+                                )
+
                                 if not found:
-                                    # 确认不存在，标记为关闭
                                     position.status = PositionStatus.CLOSED
                                     position.exit_time = datetime.now(timezone.utc)
-                                    position.exit_reason = "external_closed"  # 外部关闭（在币安手动平仓）
+                                    position.exit_reason = "external_closed"
                                     closed_count += 1
-                                    logger.info("确认持仓已关闭（币安二次确认）: {} {}", position.symbol, position.side)
+                                    logger.info("确认外部持仓已关闭: {} {}", position.symbol, position.side)
                                 else:
-                                    logger.warning("持仓 {} {} 在二次确认时发现仍存在，保持ACTIVE状态（可能是API延迟）", 
+                                    logger.warning("外部持仓 {} {} 二次确认时仍存在，保持ACTIVE（可能API延迟）",
                                                  position.symbol, position.side)
                             else:
-                                # 二次确认时API返回None，可能是临时API问题，不关闭持仓
-                                logger.warning("二次确认时币安API返回None，不关闭持仓 {} {} 以避免误操作", 
+                                logger.warning("二次确认时API返回None，不关闭外部持仓 {} {}",
                                              position.symbol, position.side)
                         except Exception as exc:
-                            # 如果二次确认失败，不关闭持仓，避免误操作
-                            logger.error("二次确认持仓状态失败: {}，保持ACTIVE状态以避免误关闭持仓 {} {}", 
+                            logger.error("二次确认失败: {}，保持ACTIVE以避免误关闭 {} {}",
                                        exc, position.symbol, position.side, exc_info=True)
+                    else:
+                        # 系统持仓或配置为不验证：直接关闭（更快）
+                        position.status = PositionStatus.CLOSED
+                        position.exit_time = datetime.now(timezone.utc)
+                        position.exit_reason = "external_closed"
+                        closed_count += 1
+                        logger.info("持仓已关闭（{}）: {} {}",
+                                  "系统持仓" if not getattr(position, 'is_external', False) else "配置为快速关闭",
+                                  position.symbol, position.side)
             
             self.db.commit()
             
