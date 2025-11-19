@@ -62,12 +62,26 @@ async function loadHistory() {
             throw new Error(errorText || `HTTP ${response.status}`);
         }
         const data = await response.json();
+        
+        // 检查是否有错误信息
+        if (data.error) {
+            console.error('API返回错误:', data.error);
+            container.innerHTML = `<p class="has-text-danger">加载失败: ${data.error} / Load failed: ${data.error}</p>`;
+            return;
+        }
+        
         historyData = data.history || [];
+        
+        if (historyData.length === 0 && data.total === 0) {
+            container.innerHTML = '<p>暂无历史记录 / No history records</p>';
+            return;
+        }
         
         renderHistory(historyData);
     } catch (error) {
         console.error('加载历史记录失败:', error);
-        container.innerHTML = '<p class="has-text-danger">加载失败，请检查网络连接 / Load failed, please check network connection</p>';
+        const errorMsg = error.message || '未知错误 / Unknown error';
+        container.innerHTML = `<p class="has-text-danger">加载失败: ${errorMsg} / Load failed: ${errorMsg}</p>`;
     }
 }
 
@@ -94,6 +108,7 @@ function renderHistory(history) {
     html += '<th>滑动退出% / Trailing %</th>';
     html += '<th>最高/最低 / High/Low</th>';
     html += '<th>盈亏% / P&L %</th>';
+    html += '<th>盈亏金额 / P&L Value (USDT)</th>';
     html += '<th>订单ID / Order ID</th>';
     html += '</tr></thead><tbody>';
     
@@ -120,13 +135,19 @@ function renderHistory(history) {
             'trailing_stop': '滑动退出 / Trailing Stop',
             'external_closed': '外部关闭 / External Closed',
             'manual': '手动 / Manual',
+            'not_executed': '未执行 / Not Executed',
         };
         const exitReason = exitReasonMap[item.exit_reason] || item.exit_reason || '-';
         
-        // 盈亏颜色
+        // 盈亏颜色和文本
         const pnlPct = item.pnl_pct;
         const pnlClass = pnlPct !== null && pnlPct !== undefined ? (pnlPct >= 0 ? 'has-text-success' : 'has-text-danger') : '';
         const pnlText = pnlPct !== null && pnlPct !== undefined ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%` : '-';
+        
+        // 盈亏金额（USDT）
+        const pnlValue = item.pnl_value;
+        const pnlValueClass = pnlValue !== null && pnlValue !== undefined ? (pnlValue >= 0 ? 'has-text-success' : 'has-text-danger') : '';
+        const pnlValueText = pnlValue !== null && pnlValue !== undefined ? `${pnlValue >= 0 ? '+' : ''}${pnlValue.toFixed(2)} USDT` : '-';
         
         // 安全格式化数字
         const formatNum = (val, decimals = 4) => {
@@ -149,6 +170,7 @@ function renderHistory(history) {
         html += `<td>${item.trailing_exit_pct !== null && item.trailing_exit_pct !== undefined ? formatNum(item.trailing_exit_pct * 100, 2) + '%' : '-'}</td>`;
         html += `<td>${item.highest_price && item.lowest_price ? `${formatNum(item.highest_price)}/${formatNum(item.lowest_price)}` : '-'}</td>`;
         html += `<td class="${pnlClass}"><strong>${pnlText}</strong></td>`;
+        html += `<td class="${pnlValueClass}"><strong>${pnlValueText}</strong></td>`;
         html += `<td><code style="font-size: 0.75rem;">${item.order_id || '-'}</code></td>`;
         html += '</tr>';
     });

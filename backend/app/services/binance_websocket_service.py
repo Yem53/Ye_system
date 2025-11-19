@@ -7,7 +7,7 @@ import threading
 import time
 from decimal import Decimal
 from threading import Lock
-from typing import Set
+from typing import Set, Any
 
 import websocket
 from loguru import logger
@@ -163,6 +163,15 @@ class BinanceWebSocketPriceService:
                 if time.time() - timestamp < 5.0:
                     result[symbol] = price
         return result
+    
+    def get_status(self) -> dict[str, Any]:
+        with self._cache_lock:
+            cache_size = len(self._price_cache)
+        return {
+            "running": self._running,
+            "subscribed_symbols": len(self._subscribed_symbols),
+            "cached_symbols": cache_size,
+        }
     
     def is_price_available(self, symbol: str) -> bool:
         """检查指定交易对的价格是否可用

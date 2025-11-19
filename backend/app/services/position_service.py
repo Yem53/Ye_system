@@ -7,6 +7,7 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import time
 
 from loguru import logger
 from sqlalchemy import select, update
@@ -17,6 +18,7 @@ from app.core.logging_config import log_key_event
 from app.models.enums import PositionStatus, ManualPlanStatus
 from app.models.manual_plan import ManualPlan
 from app.models.position import Position
+from app.models.execution_log import ExecutionLog
 from app.services.binance_service import BinanceFuturesClient
 from app.services.execution_service import ExecutionService
 
@@ -29,6 +31,43 @@ class PositionService:
         self.settings = settings or get_settings()
         self.client = BinanceFuturesClient(self.settings)
         self.executor = ExecutionService(db, settings)
+
+    def _has_system_execution_record(self, position: Position) -> bool:
+        """判断该持仓是否有系统成交记录（order_filled）"""
+        stmt = (
+            select(ExecutionLog.id)
+            .where(ExecutionLog.position_id == position.id)
+            .where(ExecutionLog.event_type == "order_filled")
+            .limit(1)
+        )
+        return self.db.scalar(stmt) is not None
+
+    def _finalize_missing_position(self, position: Position, exit_price: Decimal | None, default_reason: str = "external_closed") -> str:
+        """当币安上找不到持仓时，更新本地持仓的退出信息"""
+        reason = default_reason
+        if default_reason == "external_closed" and not self._has_system_execution_record(position):
+            reason = "not_executed"
+        position.status = PositionStatus.CLOSED
+        position.exit_price = exit_price or position.exit_price or position.entry_price
+        position.exit_quantity = position.exit_quantity or Decimal("0")
+        position.exit_time = datetime.now(timezone.utc)
+        position.exit_reason = reason
+        return reason
+
+    def _confirm_position_absent_on_binance(self, symbol: str, side: str, attempts: int = 2, delay: float = 0.2) -> bool:
+        """通过多次查询币安持仓确认该交易对确实不存在"""
+        for attempt in range(attempts):
+            binance_positions = self.client.get_positions_from_binance()
+            if binance_positions is None:
+                logger.warning("第%d次检查币安持仓失败，无法确认 %s %s 是否存在", attempt + 1, symbol, side)
+                return False
+            for bp in binance_positions:
+                if bp["symbol"] == symbol and bp["side"] == side:
+                    logger.debug("二次确认：持仓 %s %s 在币安仍存在", symbol, side)
+                    return False
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        return True
 
     def _finalize_manual_plan_if_needed(self, manual_plan_id: str | None, closed_position_id: str | None = None) -> None:
         if not manual_plan_id:
@@ -105,6 +144,20 @@ class PositionService:
         positions_to_update = []  # 需要更新最高/最低价的持仓
         positions_to_close = []  # 需要关闭的持仓
         
+        fallback_symbols: set[str] = set()
+        
+        def _resolve_price(position: Position) -> Decimal | None:
+            current_price = prices.get(position.symbol)
+            if current_price:
+                return Decimal(str(current_price))
+            cached_price = self.client.get_cached_price(position.symbol)
+            if cached_price:
+                fallback_symbols.add(position.symbol)
+                return Decimal(str(cached_price))
+            # 缺少实时价格时，使用入场价作为保守值
+            fallback_symbols.add(position.symbol)
+            return position.entry_price
+        
         if len(positions) >= PARALLEL_THRESHOLD:
             # 多个持仓时并行处理（充分利用CPU资源）
             max_workers = min(len(positions), CPU_COUNT, 8)  # 最多8个并发，避免过多线程
@@ -129,15 +182,7 @@ class PositionService:
             # 准备数据
             position_data = []
             for position in positions:
-                current_price = prices.get(position.symbol)
-                if not current_price:
-                    # 如果批量获取失败，尝试单独获取
-                    try:
-                        current_price = self.client.get_mark_price(position.symbol)
-                    except Exception:
-                        logger.debug("无法获取 %s 的标记价格", position.symbol)
-                        continue
-                
+                current_price = _resolve_price(position)
                 if current_price:
                     position_data.append((position, current_price))
             
@@ -162,15 +207,10 @@ class PositionService:
             # 单个持仓时串行处理（避免线程开销）
             for position in positions:
                 try:
-                    current_price = prices.get(position.symbol)
-                    if not current_price:
-                        try:
-                            current_price = self.client.get_mark_price(position.symbol)
-                        except Exception:
-                            logger.debug("无法获取 %s 的标记价格", position.symbol)
-                            continue
-                    
-                    current_price_decimal = Decimal(str(current_price))
+                    current_price_decimal = _resolve_price(position)
+                    if current_price_decimal is None:
+                        logger.debug("无法获取 %s 的标记价格，跳过本次检查", position.symbol)
+                        continue
                     should_exit, exit_reason = self._should_exit_position(position, current_price_decimal)
                     
                     if should_exit:
@@ -179,6 +219,16 @@ class PositionService:
                         positions_to_update.append((position, current_price_decimal))
                 except Exception as exc:
                     logger.error("监控持仓 %s 时出错: %s", position.id, exc, exc_info=True)
+        
+        if fallback_symbols:
+            symbols_preview = ", ".join(sorted(fallback_symbols)[:5])
+            if len(fallback_symbols) > 5:
+                symbols_preview += ", ..."
+            logger.warning(
+                "暂时无法获取 %d 个交易对的实时价格，已使用缓存/入场价：%s",
+                len(fallback_symbols),
+                symbols_preview,
+            )
         
         # 执行关闭操作（串行执行，避免并发问题）
         for position, current_price, exit_reason in positions_to_close:
@@ -220,11 +270,33 @@ class PositionService:
                         start_time_ms = int(start_time.timestamp() * 1000)
                         end_time_ms = int(now.timestamp() * 1000)
                         
-                        # 获取1分钟K线数据
+                        # 根据中断时间动态选择K线精度（精度很重要，滑动退出需要精确的最高/最低价）
+                        time_range_hours = (end_time_ms - start_time_ms) / (1000 * 3600)
+                        if time_range_hours <= 1:
+                            # 1小时内：使用1分钟K线，最多1000条（约16.7小时）
+                            interval = "1m"
+                            limit = 1000
+                        elif time_range_hours <= 8:
+                            # 1-8小时：使用1分钟K线，最多500条（约8.3小时）
+                            interval = "1m"
+                            limit = 500
+                        elif time_range_hours <= 24:
+                            # 8-24小时：使用5分钟K线，最多500条（约41.7小时）
+                            interval = "5m"
+                            limit = 500
+                        else:
+                            # 超过24小时：使用15分钟K线，最多500条（约125小时）
+                            interval = "15m"
+                            limit = 500
+                        
+                        logger.info("从K线数据恢复历史价格: %s %s, 中断时间=%.1f小时, 使用K线间隔=%s, limit=%d", 
+                                  position.id, position.symbol, time_range_hours, interval, limit)
+                        
+                        # 获取K线数据（使用动态选择的精度）
                         klines = self.client.get_klines(
                             symbol=position.symbol,
-                            interval="1m",
-                            limit=500,
+                            interval=interval,
+                            limit=limit,
                             start_time=start_time_ms,
                             end_time=end_time_ms
                         )
@@ -463,6 +535,11 @@ class PositionService:
     def _close_position(self, position: Position, exit_price: Decimal, reason: str) -> None:
         """关闭持仓"""
         try:
+            # 重要：检查持仓状态，避免重复关闭（并行处理可能导致多个线程同时尝试关闭）
+            if position.status == PositionStatus.CLOSED:
+                logger.debug("持仓 %s 已经关闭，跳过重复关闭操作", position.id)
+                return
+            
             # 平仓（反向操作）
             close_side = "SELL" if position.side == "BUY" else "BUY"
             
@@ -470,21 +547,32 @@ class PositionService:
             # 因为实际持仓可能已经变化（部分平仓、加仓等）
             actual_quantity = None
             position_found_on_binance = False
-            try:
-                binance_positions = self.client.get_positions_from_binance()
-                for binance_pos in binance_positions:
-                    if (binance_pos["symbol"] == position.symbol and 
-                        binance_pos["side"] == position.side):
-                        actual_quantity = Decimal(str(binance_pos["position_amt"]))
-                        position_found_on_binance = True
-                        logger.info("从币安获取实际持仓数量: %s %s = %s (数据库数量: %s)", 
-                                   position.symbol, position.side, actual_quantity, position.entry_quantity)
-                        break
-            except Exception as exc:
-                logger.warning("获取币安实际持仓数量失败: %s，使用数据库数量", exc)
+            positions_fetch_failed = False
+            binance_positions = self.client.get_positions_from_binance()
+            if binance_positions is None:
+                positions_fetch_failed = True
+                binance_positions = []
+            for binance_pos in binance_positions:
+                if (binance_pos["symbol"] == position.symbol and 
+                    binance_pos["side"] == position.side):
+                    actual_quantity = Decimal(str(binance_pos["position_amt"]))
+                    position_found_on_binance = True
+                    logger.info("从币安获取实际持仓数量: %s %s = %s (数据库数量: %s)", 
+                               position.symbol, position.side, actual_quantity, position.entry_quantity)
+                    break
             
             # 如果币安上已经没有这个持仓了，需要判断是系统刚关闭还是外部关闭
             if not position_found_on_binance:
+                if positions_fetch_failed:
+                    logger.warning("无法获取币安持仓状态，暂不标记 %s %s 为外部关闭，等待下次检查", 
+                                 position.symbol, position.side)
+                    return
+                # 再次检查持仓状态（可能在检查币安持仓时，其他线程已经关闭了）
+                self.db.refresh(position)
+                if position.status == PositionStatus.CLOSED:
+                    logger.debug("持仓 %s 在检查币安持仓期间已被关闭，跳过重复关闭操作", position.id)
+                    return
+                
                 # 检查是否有最近的系统关闭记录（5分钟内）
                 try:
                     from app.models.execution_log import ExecutionLog
@@ -503,27 +591,37 @@ class PositionService:
                         system_reason = payload.get("reason", reason)
                         logger.info("币安上已无持仓 %s %s，但检测到系统关闭记录（原因: %s），使用系统退出原因", 
                                   position.symbol, position.side, system_reason)
-                        position.status = PositionStatus.CLOSED
-                        position.exit_price = exit_price if exit_price else (Decimal(str(recent_close_log.price)) if recent_close_log.price else position.entry_price)
-                        position.exit_quantity = Decimal("0")  # 已无持仓，数量为0
-                        position.exit_time = recent_close_log.created_at if recent_close_log.created_at else datetime.now(timezone.utc)
-                        position.exit_reason = system_reason  # 使用系统设置的退出原因
+                        # 再次检查状态（避免并发问题）
+                        self.db.refresh(position)
+                        if position.status == PositionStatus.CLOSED:
+                            logger.debug("持仓 %s 在检查关闭记录期间已被关闭，跳过重复关闭操作", position.id)
+                            return
+                        reason_used = self._finalize_missing_position(
+                            position,
+                            exit_price if exit_price else (Decimal(str(recent_close_log.price)) if recent_close_log.price else position.entry_price),
+                            default_reason=system_reason,
+                        )
                         self.db.commit()
-                        log_key_event("INFO", "持仓 %s 已标记为已关闭（系统关闭，原因: %s）", position.id, system_reason)
+                        log_key_event("INFO", "持仓 %s 已标记为已关闭（系统关闭，原因: %s）", position.id, reason_used)
                         return
                 except Exception as exc:
                     logger.debug("检查系统关闭记录失败: %s，继续处理", exc)
                 
                 # 没有系统关闭记录，可能是外部手动平仓
-                logger.warning("币安上已无持仓 %s %s，且无系统关闭记录，可能已被手动平仓，标记为外部关闭", 
-                             position.symbol, position.side)
-                position.status = PositionStatus.CLOSED
-                position.exit_price = exit_price
-                position.exit_quantity = Decimal("0")  # 已无持仓，数量为0
-                position.exit_time = datetime.now(timezone.utc)
-                position.exit_reason = "external_closed"  # 外部关闭（在币安手动平仓）
+                # 再次检查状态（避免并发问题）
+                self.db.refresh(position)
+                if position.status == PositionStatus.CLOSED:
+                    logger.debug("持仓 %s 在检查期间已被关闭，跳过重复关闭操作", position.id)
+                    return
+                if not self._confirm_position_absent_on_binance(position.symbol, position.side):
+                    logger.info("再次检查后发现持仓 %s %s 仍存在或无法确认，保持 ACTIVE 状态", position.symbol, position.side)
+                    return
+                reason_used = self._finalize_missing_position(position, exit_price or position.entry_price, default_reason="external_closed")
                 self.db.commit()
-                log_key_event("INFO", "持仓 %s 已标记为已关闭（外部关闭）", position.id)
+                if reason_used == "external_closed":
+                    log_key_event("INFO", "持仓 %s 已标记为已关闭（外部关闭）", position.id)
+                else:
+                    log_key_event("INFO", "持仓 %s 已标记为未执行（未检测到系统成交记录）", position.id)
                 return
             
             # 如果无法获取实际数量，使用数据库中的数量
@@ -562,6 +660,12 @@ class PositionService:
                 log_key_event("INFO", "开始平仓持仓 %s (%s %s): 实际数量=%s, 方向=%s, 原因=%s", 
                        position.id, position.symbol, position.side, 
                        actual_quantity, close_side, reason)
+            
+            # 在下单前再次检查持仓状态（避免并发问题）
+            self.db.refresh(position)
+            if position.status == PositionStatus.CLOSED:
+                logger.debug("持仓 %s 在下单前已被关闭，跳过重复下单", position.id)
+                return
             
             # 使用实际持仓数量平仓，添加 reduceOnly=true 确保这是平仓而不是开新仓
             # 这样可以避免需要额外的保证金（特别是做空持仓平仓时需要买入的情况）
@@ -890,11 +994,33 @@ class PositionService:
                             start_time_ms = int(position.last_check_time.timestamp() * 1000)
                             end_time_ms = int(now.timestamp() * 1000)
                             
-                            # 获取1分钟K线数据（最多500条，约8小时）
+                            # 根据中断时间动态选择K线精度（精度很重要，滑动退出需要精确的最高/最低价）
+                            time_range_hours = (end_time_ms - start_time_ms) / (1000 * 3600)
+                            if time_range_hours <= 1:
+                                # 1小时内：使用1分钟K线，最多1000条（约16.7小时）
+                                interval = "1m"
+                                limit = 1000
+                            elif time_range_hours <= 8:
+                                # 1-8小时：使用1分钟K线，最多500条（约8.3小时）
+                                interval = "1m"
+                                limit = 500
+                            elif time_range_hours <= 24:
+                                # 8-24小时：使用5分钟K线，最多500条（约41.7小时）
+                                interval = "5m"
+                                limit = 500
+                            else:
+                                # 超过24小时：使用15分钟K线，最多500条（约125小时）
+                                interval = "15m"
+                                limit = 500
+                            
+                            logger.info("从K线数据恢复历史价格: %s %s, 中断时间=%.1f小时, 使用K线间隔=%s, limit=%d", 
+                                      symbol, side, time_range_hours, interval, limit)
+                            
+                            # 获取K线数据（使用动态选择的精度）
                             klines = self.client.get_klines(
                                 symbol=symbol,
-                                interval="1m",
-                                limit=500,
+                                interval=interval,
+                                limit=limit,
                                 start_time=start_time_ms,
                                 end_time=end_time_ms
                             )
@@ -1094,13 +1220,11 @@ class PositionService:
                                         break
                                 
                                 if not found:
-                                    # 确认不存在，标记为关闭
-                                    # 只有在没有系统关闭记录的情况下，才标记为外部关闭
-                                    position.status = PositionStatus.CLOSED
-                                    position.exit_time = datetime.now(timezone.utc)
-                                    position.exit_reason = "external_closed"  # 外部关闭（在币安手动平仓）
+                                    # 确认不存在，标记为关闭（可能是外部关闭或从未真正成交）
+                                    reason_used = self._finalize_missing_position(position, position.exit_price or position.entry_price, default_reason="external_closed")
                                     closed_count += 1
-                                    logger.info("确认持仓已关闭（币安二次确认，外部关闭）: {} {}", position.symbol, position.side)
+                                    logger.info("确认持仓已关闭（币安二次确认，原因: %s）: %s %s", 
+                                                reason_used, position.symbol, position.side)
                                 else:
                                     logger.warning("持仓 {} {} 在二次确认时发现仍存在，保持ACTIVE状态（可能是API延迟）", 
                                                  position.symbol, position.side)

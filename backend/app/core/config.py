@@ -72,7 +72,11 @@ class Settings(BaseSettings):
         ],
         description="需要计算收益的时间窗口",
     )
-    binance_http_timeout: int = Field(5, description="访问币安 API 的超时时间（秒），降低以提高响应速度）")
+    binance_http_timeout: int = Field(5, description="访问币安 API 的超时时间（秒）")
+    binance_max_retries: int = Field(3, description="访问币安 API 的最大重试次数")
+    binance_retry_backoff: float = Field(0.5, description="币安 API 重试的初始退避时间（秒），指数退避")
+    binance_rest_fail_threshold: int = Field(5, description="连续 REST 失败次数阈值，超过后触发降级日志")
+    binance_rest_fail_cooldown: float = Field(10.0, description="连续失败后再次记录警告的冷却时间（秒）")
     price_cache_ttl: float = Field(1.0, description="价格缓存时间（秒），默认1秒")
     balance_cache_ttl: float = Field(2.0, description="余额缓存时间（秒），默认2秒")
     websocket_price_enabled: bool = Field(True, description="是否启用WebSocket价格订阅服务，启用后可大幅降低价格获取延迟")

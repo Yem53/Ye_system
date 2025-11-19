@@ -4,7 +4,10 @@ import time
 from collections import defaultdict
 from decimal import Decimal
 from threading import Lock
+from typing import Any
 
+import requests
+from requests import RequestException
 from binance.client import Client
 from loguru import logger
 
@@ -19,9 +22,14 @@ class BinanceFuturesClient:
     _all_prices_cache: dict[str, tuple[dict[str, Decimal], float]] = {}  # {"all": ({symbol: price}, timestamp)}
     _symbol_info_cache: dict[str, dict] = {}  # {symbol: {stepSize, tickSize, ...}}
     _cache_lock = Lock()
+    _rest_failure_streak: int = 0
+    _rest_last_failure_ts: float = 0.0
+    _rest_last_warning_ts: float = 0.0
     
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self._http = requests.Session()
+        self._http.headers.update({"User-Agent": "QuantNewsCodex/1.0"})
         
         # 配置代理（如果设置了 HTTP_PROXY，支持 Clash 等 VPN 代理）
         proxies = None
@@ -35,6 +43,7 @@ class BinanceFuturesClient:
                 proxy_info = f"HTTP: {self.settings.http_proxy or '未设置'}, HTTPS: {self.settings.https_proxy or '未设置'}"
                 logger.info("使用代理: {}", proxy_info)
                 BinanceFuturesClient._proxy_logged = True
+        self._proxies = proxies
         
         # 使用 Client 类，通过 base_endpoint 参数指定合约交易端点
         # 注意：禁用 ping 以避免初始化时的网络请求
@@ -49,6 +58,132 @@ class BinanceFuturesClient:
         # binance 库内部使用 requests，需要手动设置 session 的代理
         if proxies:
             self.client.session.proxies.update(proxies)
+
+    def _build_proxies(self) -> dict[str, str] | None:
+        if self._proxies:
+            return self._proxies
+        if self.settings.http_proxy or self.settings.https_proxy:
+            return {
+                "http": self.settings.http_proxy or self.settings.https_proxy,
+                "https": self.settings.https_proxy or self.settings.http_proxy,
+            }
+        return None
+
+    def _record_rest_failure(self, exc: Exception) -> None:
+        with BinanceFuturesClient._cache_lock:
+            BinanceFuturesClient._rest_failure_streak += 1
+            BinanceFuturesClient._rest_last_failure_ts = time.time()
+            streak = BinanceFuturesClient._rest_failure_streak
+            now = BinanceFuturesClient._rest_last_failure_ts
+            if (
+                streak >= self.settings.binance_rest_fail_threshold
+                and now - BinanceFuturesClient._rest_last_warning_ts >= self.settings.binance_rest_fail_cooldown
+            ):
+                logger.warning(
+                    "币安 REST 接口连续失败 {} 次（最近错误: {}），正在使用退避重试并保持现有持仓状态",
+                    streak,
+                    exc,
+                )
+                BinanceFuturesClient._rest_last_warning_ts = now
+
+    def _reset_rest_failure(self) -> None:
+        with BinanceFuturesClient._cache_lock:
+            if BinanceFuturesClient._rest_failure_streak:
+                BinanceFuturesClient._rest_failure_streak = 0
+
+    @classmethod
+    def get_rest_health(cls) -> dict[str, Any]:
+        with cls._cache_lock:
+            streak = cls._rest_failure_streak
+            last_fail = cls._rest_last_failure_ts
+            last_warning = cls._rest_last_warning_ts
+        status = "degraded" if streak else "ok"
+        return {
+            "status": status,
+            "failure_streak": streak,
+            "last_failure_ts": last_fail,
+            "last_warning_ts": last_warning,
+        }
+
+    def _send_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        data: dict | None = None,
+        headers: dict | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        backoff: float | None = None,
+    ) -> requests.Response:
+        timeout = timeout or self.settings.binance_http_timeout
+        max_retries = max(1, max_retries or self.settings.binance_max_retries)
+        backoff = backoff or self.settings.binance_retry_backoff
+        last_exc: RequestException | None = None
+        for attempt in range(max_retries):
+            try:
+                response = self._http.request(
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies=self._build_proxies(),
+                )
+                response.raise_for_status()
+                self._reset_rest_failure()
+                return response
+            except RequestException as exc:
+                last_exc = exc
+                self._record_rest_failure(exc)
+                if attempt < max_retries - 1:
+                    sleep = backoff * (2 ** attempt)
+                    logger.debug(
+                        "请求 %s %s 失败（第 %d/%d 次尝试）：%s，将在 %.2f 秒后重试",
+                        method.upper(),
+                        url,
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                        sleep,
+                    )
+                    time.sleep(sleep)
+                else:
+                    raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("未预期的请求错误")
+
+    def _signed_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        data: dict | None = None,
+    ) -> requests.Response:
+        import hmac
+        import hashlib
+        from urllib.parse import urlencode
+        from datetime import datetime, timezone
+
+        if not self.settings.binance_api_key or not self.settings.binance_api_secret:
+            raise ValueError("API密钥未配置")
+
+        params = params.copy() if params else {}
+        params["timestamp"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        query_string = urlencode(params, doseq=True)
+        signature = hmac.new(
+            self.settings.binance_api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        params["signature"] = signature
+        headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
+        return self._send_request(method, url, params=params, data=data, headers=headers)
 
     def get_klines(self, symbol: str, interval: str = "1m", limit: int = 500, start_time: int | None = None, end_time: int | None = None) -> list[list]:
         """获取K线数据（用于恢复中断期间的历史最高/最低价）
@@ -65,8 +200,6 @@ class BinanceFuturesClient:
         """
         symbol = symbol.upper()
         try:
-            import requests
-            
             url = "https://fapi.binance.com/fapi/v1/klines"
             params = {
                 "symbol": symbol,
@@ -79,15 +212,7 @@ class BinanceFuturesClient:
             if end_time:
                 params["endTime"] = end_time
             
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            response = self._send_request("GET", url, params=params)
             return response.json()
         except Exception as exc:
             logger.warning("获取K线数据失败 ({}): {}", symbol, exc)
@@ -103,21 +228,9 @@ class BinanceFuturesClient:
                 return BinanceFuturesClient._symbol_info_cache[symbol]
         
         try:
-            import requests
-            from datetime import datetime, timezone
-            
             # 获取交易对信息（不需要签名）
             url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            response = self._send_request("GET", url)
             data = response.json()
             
             # 查找目标交易对
@@ -156,38 +269,8 @@ class BinanceFuturesClient:
     def get_position_mode(self) -> str:
         """获取账户持仓模式：ONE_WAY_MODE（单向）或 HEDGE_MODE（双向）"""
         try:
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
-            if not self.settings.binance_api_key or not self.settings.binance_api_secret:
-                raise ValueError("API密钥未配置")
-            
             url = "https://fapi.binance.com/fapi/v1/positionSide/dual"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            response = self._signed_request("GET", url)
             data = response.json()
             
             # 返回持仓模式：True 表示双向持仓（HEDGE_MODE），False 表示单向持仓（ONE_WAY_MODE）
@@ -199,98 +282,29 @@ class BinanceFuturesClient:
     def set_leverage(self, symbol: str, leverage: int) -> None:
         """设置合约杠杆倍数"""
         try:
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
-            # 检查API密钥是否配置
-            if not self.settings.binance_api_key or not self.settings.binance_api_secret:
-                raise ValueError("API密钥未配置")
-            
             url = "https://fapi.binance.com/fapi/v1/leverage"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
             params = {
                 "symbol": symbol,
                 "leverage": leverage,
-                "timestamp": timestamp,
             }
             
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = self._signed_request("POST", url, params=params)
             
             if response.status_code == 401:
                 error_msg = response.json().get("msg", "Unauthorized")
                 logger.error("设置杠杆API认证失败: {} (code: {})", error_msg, response.status_code)
                 raise ValueError(f"API认证失败: {error_msg}")
-            
-            response.raise_for_status()
         except Exception as exc:  # pragma: no cover - network
             logger.error("设置杠杆失败 {}: {}", symbol, exc)
             raise
 
-    def _make_signed_request(self, url: str, params: dict = None) -> dict:
+    def _make_signed_request(self, url: str, params: dict | None = None, method: str = "GET") -> dict:
         """通用的签名请求方法"""
-        import requests
-        import hmac
-        import hashlib
-        from urllib.parse import urlencode
-        from datetime import datetime, timezone
-        
-        if params is None:
-            params = {}
-        
-        # 使用 UTC 时间，而不是系统本地时间
-        timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-        params["timestamp"] = timestamp
-        
-        # 生成签名（币安 API 使用 SHA256）
-        query_string = urlencode(params, doseq=True)
-        signature = hmac.new(
-            self.settings.binance_api_secret.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        
-        params["signature"] = signature
-        headers = {
-            "X-MBX-APIKEY": self.settings.binance_api_key
-        }
-        
-        # 使用代理
-        proxies = None
-        if self.settings.http_proxy or self.settings.https_proxy:
-            proxies = {
-                "http": self.settings.http_proxy or self.settings.https_proxy,
-                "https": self.settings.https_proxy or self.settings.http_proxy,
-            }
-        
-        response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-        
-        # 检查响应
+        response = self._signed_request(method, url, params=params)
         if response.status_code == 401:
             error_msg = response.json().get("msg", "Unauthorized")
             logger.error("币安API认证失败: {} (code: {})", error_msg, response.status_code)
             raise ValueError(f"API认证失败: {error_msg}")
-        
-        response.raise_for_status()
         return response.json()
 
     def get_futures_balance(self) -> Decimal:
@@ -418,42 +432,8 @@ class BinanceFuturesClient:
                 logger.warning("币安API密钥未配置，无法获取账户余额")
                 raise ValueError("API密钥未配置")
             
-            # 获取杠杆账户余额
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
             url = "https://api.binance.com/sapi/v1/margin/account"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            
-            if response.status_code == 401:
-                error_msg = response.json().get("msg", "Unauthorized")
-                raise ValueError(f"API认证失败: {error_msg}")
-            
-            response.raise_for_status()
-            account = response.json()
+            account = self._make_signed_request(url)
             
             # 杠杆账户返回的是 userAssets 数组
             user_assets = account.get("userAssets", [])
@@ -480,42 +460,8 @@ class BinanceFuturesClient:
     def get_wallet_futures_balance(self) -> Decimal:
         """获取资金账户（Wallet）中分配给合约账户的 USDT 余额"""
         try:
-            # 使用钱包API获取合约账户余额
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
             url = "https://api.binance.com/sapi/v3/asset/getUserAsset"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp, "asset": "USDT"}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            
-            if response.status_code == 401:
-                error_msg = response.json().get("msg", "Unauthorized")
-                raise ValueError(f"API认证失败: {error_msg}")
-            
-            response.raise_for_status()
-            wallet_data = response.json()
+            wallet_data = self._make_signed_request(url, params={"asset": "USDT"}, method="POST")
             
             # 查找合约账户余额
             if isinstance(wallet_data, list):
@@ -533,42 +479,8 @@ class BinanceFuturesClient:
     def get_wallet_spot_balance(self) -> Decimal:
         """获取资金账户（Wallet）中分配给现货账户的 USDT 余额"""
         try:
-            # 使用钱包API获取现货账户余额
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
             url = "https://api.binance.com/sapi/v3/asset/getUserAsset"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp, "asset": "USDT"}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            
-            if response.status_code == 401:
-                error_msg = response.json().get("msg", "Unauthorized")
-                raise ValueError(f"API认证失败: {error_msg}")
-            
-            response.raise_for_status()
-            wallet_data = response.json()
+            wallet_data = self._make_signed_request(url, params={"asset": "USDT"}, method="POST")
             
             # 查找现货账户余额
             if isinstance(wallet_data, list):
@@ -600,36 +512,7 @@ class BinanceFuturesClient:
             from datetime import datetime, timezone
             
             url = "https://api.binance.com/sapi/v3/asset/getUserAsset"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp, "asset": "USDT"}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            # sapi 使用 POST 方法
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            
-            if response.status_code == 401:
-                error_msg = response.json().get("msg", "Unauthorized")
-                logger.error("币安钱包API认证失败: {} (code: {})", error_msg, response.status_code)
-                raise ValueError(f"API认证失败: {error_msg}")
-            
-            response.raise_for_status()
-            wallet_data = response.json()
+            wallet_data = self._make_signed_request(url, params={"asset": "USDT"}, method="POST")
             
             # 钱包API返回的是数组
             # sapi/v3/asset/getUserAsset 返回的字段（根据币安官方文档）：
@@ -783,16 +666,11 @@ class BinanceFuturesClient:
                 logger.warning("获取持仓模式失败，默认使用单向持仓: %s", exc)
                 position_mode = "ONE_WAY_MODE"
             
-            # 重要：在生成签名之前重新生成时间戳，避免因为前面的操作导致时间戳过期
-            # 使用UTC时间生成时间戳，并添加recvWindow参数以允许更大的时间窗口
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            
             params = {
                 "symbol": symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": quantity_str,
-                "timestamp": timestamp,
                 "recvWindow": 10000,  # 增加到10秒的时间窗口，避免时间戳过期
             }
             
@@ -818,25 +696,7 @@ class BinanceFuturesClient:
                     if "reduceOnly" in params:
                         del params["reduceOnly"]
             
-            # 生成签名（在构建完所有参数后）
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = self._signed_request("POST", url, params=params)
             
             if response.status_code != 200:
                 try:
@@ -866,20 +726,15 @@ class BinanceFuturesClient:
     ) -> dict:
         """下限价单（直接使用 requests，避免 python-binance 库的 URL 拼接问题）"""
         try:
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
+            from decimal import ROUND_DOWN
             from datetime import datetime, timezone
             
             if not self.settings.binance_api_key or not self.settings.binance_api_secret:
                 raise ValueError("API密钥未配置")
             
             url = "https://fapi.binance.com/fapi/v1/order"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
             
             # 确保数量精度正确（动态获取交易对的 stepSize）
-            from decimal import Decimal, ROUND_DOWN
             quantity_decimal = Decimal(str(quantity))
             
             # 获取交易对的 stepSize（数量精度）
@@ -915,31 +770,13 @@ class BinanceFuturesClient:
                 "timeInForce": time_in_force,
                 "quantity": quantity_str,
                 "price": price_str,
-                "timestamp": timestamp,
             }
             
             # 如果是双向持仓模式，需要指定 positionSide
             if position_mode == "HEDGE_MODE":
                 params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
             
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.post(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = self._signed_request("POST", url, params=params)
             
             if response.status_code != 200:
                 try:
@@ -978,42 +815,16 @@ class BinanceFuturesClient:
     def get_order_status(self, symbol: str, order_id: str) -> dict:
         """查询订单状态（直接使用 requests，避免 python-binance 库的 URL 拼接问题）"""
         try:
-            import requests
-            import hmac
-            import hashlib
-            from urllib.parse import urlencode
-            from datetime import datetime, timezone
-            
             if not self.settings.binance_api_key or not self.settings.binance_api_secret:
                 raise ValueError("API密钥未配置")
             
             url = "https://fapi.binance.com/fapi/v1/order"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            
             params = {
                 "symbol": symbol,
                 "orderId": order_id,
-                "timestamp": timestamp,
             }
             
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response = self._signed_request("GET", url, params=params)
             
             if response.status_code != 200:
                 try:
@@ -1056,20 +867,8 @@ class BinanceFuturesClient:
                     return price
         
         try:
-            # 直接使用 requests 获取标记价格（避免 python-binance 库的 URL 拼接问题）
-            import requests
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            params = {"symbol": symbol}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            response = self._send_request("GET", url, params={"symbol": symbol})
             data = response.json()
             price = Decimal(data.get("markPrice", "0"))
             
@@ -1082,6 +881,15 @@ class BinanceFuturesClient:
             logger.warning("获取标记价格失败 {}: {}", symbol, exc)
             return None
     
+    def get_cached_price(self, symbol: str) -> Decimal | None:
+        symbol = symbol.upper()
+        with BinanceFuturesClient._cache_lock:
+            if symbol in BinanceFuturesClient._price_cache:
+                price, timestamp = BinanceFuturesClient._price_cache[symbol]
+                if time.time() - timestamp < self.settings.price_cache_ttl * 3:
+                    return price
+        return None
+    
     def get_all_mark_prices(self) -> dict[str, Decimal]:
         """批量获取所有交易对的标记价格（带缓存）"""
         # 检查缓存
@@ -1092,19 +900,8 @@ class BinanceFuturesClient:
                     return prices
         
         try:
-            # 直接使用 requests 获取所有标记价格（避免 python-binance 库的 URL 拼接问题）
-            import requests
             url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params={}, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            response = self._send_request("GET", url, params={})
             data = response.json()
             
             # 解析结果（可能是列表或单个对象）
@@ -1132,33 +929,54 @@ class BinanceFuturesClient:
             return {}
     
     def get_mark_prices_batch(self, symbols: list[str]) -> dict[str, Decimal]:
-        """批量获取指定交易对的标记价格（优先使用批量API）"""
+        """批量获取指定交易对的标记价格（优先使用批量API与缓存）"""
         if not symbols:
             return {}
         
-        # 如果请求的交易对很多，使用批量API获取所有价格
-        if len(symbols) > 5:
+        symbols = [s.upper() for s in symbols]
+        result: dict[str, Decimal] = {}
+        
+        # 1. 尝试 WebSocket 缓存
+        if self.settings.websocket_price_enabled:
+            try:
+                ws_service = get_websocket_price_service()
+                for symbol in symbols:
+                    price = ws_service.get_price(symbol)
+                    if price is not None:
+                        result[symbol] = Decimal(str(price))
+            except Exception as exc:
+                logger.debug("批量获取 WebSocket 价格失败: {}", exc)
+        
+        missing = [s for s in symbols if s not in result]
+        
+        # 2. 使用批量REST接口一次性获取
+        if missing:
             all_prices = self.get_all_mark_prices()
-            return {symbol: all_prices.get(symbol, Decimal("0")) for symbol in symbols}
+            for symbol in missing:
+                if symbol in all_prices:
+                    result[symbol] = all_prices[symbol]
+            missing = [s for s in symbols if s not in result]
         
-        # 少量交易对，并行获取
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # 3. 使用最近缓存
+        if missing:
+            for symbol in list(missing):
+                cached = self.get_cached_price(symbol)
+                if cached is not None:
+                    result[symbol] = cached
+            missing = [s for s in symbols if s not in result]
         
-        result = {}
-        with ThreadPoolExecutor(max_workers=min(len(symbols), 10)) as executor:
-            futures = {executor.submit(self.get_mark_price, symbol): symbol for symbol in symbols}
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    price = future.result()
-                    if price:
-                        result[symbol] = price
-                except Exception:
-                    pass
+        # 4. 少量 Symbol 无法获取时，逐个调用 REST（限制请求数量以避免超时）
+        if missing:
+            MAX_SINGLE_FETCH = 3
+            for symbol in missing[:MAX_SINGLE_FETCH]:
+                price = self.get_mark_price(symbol)
+                if price is not None:
+                    result[symbol] = price
+            # 其余缺失的使用 entry price 回退（由调用方处理）
         
         return result
     
-    def get_positions_from_binance(self) -> list[dict]:
+    def get_positions_from_binance(self) -> list[dict] | None:
         """
         从币安API获取所有实际持仓（包括非系统下单的持仓）
         返回格式: [
@@ -1187,28 +1005,8 @@ class BinanceFuturesClient:
             
             # 使用 fapi/v2/positionRisk 获取所有持仓信息
             url = "https://fapi.binance.com/fapi/v2/positionRisk"
-            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-            params = {"timestamp": timestamp}
-            
-            query_string = urlencode(params, doseq=True)
-            signature = hmac.new(
-                self.settings.binance_api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": self.settings.binance_api_key}
-            
-            proxies = None
-            if self.settings.http_proxy or self.settings.https_proxy:
-                proxies = {
-                    "http": self.settings.http_proxy or self.settings.https_proxy,
-                    "https": self.settings.https_proxy or self.settings.http_proxy,
-                }
-            
-            response = requests.get(url, params=params, headers=headers, proxies=proxies, timeout=self.settings.binance_http_timeout)
-            response.raise_for_status()
+            params = {"recvWindow": 10000}
+            response = self._signed_request("GET", url, params=params)
             data = response.json()
             
             # 过滤出有持仓的交易对（positionAmt != 0）
@@ -1237,4 +1035,4 @@ class BinanceFuturesClient:
             return positions
         except Exception as exc:
             logger.error("从币安获取持仓失败: {}", exc)
-            return []
+            return None

@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 import asyncio
 
@@ -15,6 +16,7 @@ from app.models.manual_plan import ManualPlan
 from app.models.position import Position
 from app.schemas.manual_plan import ManualPlanCreate, ManualPlanRead
 from app.services.binance_service import BinanceFuturesClient
+from app.services.binance_websocket_service import get_websocket_price_service
 from app.services.manual_plan_service import ManualPlanService
 from app.services.position_service import PositionService
 from app.services.websocket_service import websocket_manager
@@ -70,6 +72,32 @@ def get_account_info(db: Session = Depends(get_db)):
         }
     except Exception as exc:
         return {"error": str(exc), "balance": 0, "currency": "USDT"}
+
+
+@router.get("/health/binance")
+def get_binance_health():
+    """获取币安接口与WebSocket健康状态"""
+    settings = get_settings()
+    client = BinanceFuturesClient(settings)
+    rest_health = client.get_rest_health()
+    
+    websocket_health: dict[str, Any]
+    if settings.websocket_price_enabled:
+        try:
+            ws_service = get_websocket_price_service()
+            websocket_health = ws_service.get_status()
+        except Exception as exc:
+            websocket_health = {
+                "running": False,
+                "error": str(exc),
+            }
+    else:
+        websocket_health = {"running": False, "enabled": False}
+    
+    return {
+        "rest": rest_health,
+        "websocket": websocket_health,
+    }
 
 
 @router.get("/realtime/positions")
@@ -355,98 +383,124 @@ def get_trading_history(
     """
     from sqlalchemy import desc, select
     from app.models.enums import PositionStatus
+    from loguru import logger
     
-    history: list[dict] = []
-    allowed_log_events = {"order_filled", "position_closed"}
+    try:
+        history: list[dict] = []
+        allowed_log_events = {"order_filled", "position_closed"}
 
-    logs: list[ExecutionLog] = []
-    if include_logs:
-        logs_stmt = (
-            select(ExecutionLog)
-            .where(ExecutionLog.event_type.in_(allowed_log_events))
-            .order_by(desc(ExecutionLog.created_at))
+        logs: list[ExecutionLog] = []
+        if include_logs:
+            logs_stmt = (
+                select(ExecutionLog)
+                .where(ExecutionLog.event_type.in_(allowed_log_events))
+                .order_by(desc(ExecutionLog.created_at))
+                .limit(limit)
+                .offset(offset)
+            )
+            logs = list(db.scalars(logs_stmt))
+        
+        # 获取所有已关闭的持仓（包含完整的退出信息）
+        positions_stmt = (
+            select(Position)
+            .where(Position.status == PositionStatus.CLOSED)
+            .order_by(desc(Position.exit_time))
             .limit(limit)
             .offset(offset)
         )
-        logs = list(db.scalars(logs_stmt))
-    
-    # 获取所有已关闭的持仓（包含完整的退出信息）
-    positions_stmt = (
-        select(Position)
-        .where(Position.status == PositionStatus.CLOSED)
-        .order_by(desc(Position.exit_time))
-        .limit(limit)
-        .offset(offset)
-    )
-    positions = list(db.scalars(positions_stmt))
-    
-    # 构建历史记录
-    # 处理执行日志
-    for log in logs:
-        history.append(
-            {
-                "type": "execution_log",
-                "id": log.id,
-                "event_type": log.event_type,
-                "symbol": log.symbol,
-                "side": log.side,
-                "price": float(log.price) if log.price else None,
-                "quantity": float(log.quantity) if log.quantity else None,
-                "order_id": log.order_id,
-                "status": log.status,
-                "timestamp": log.created_at.isoformat() if log.created_at else None,
-                "payload": log.payload,
-                "manual_plan_id": log.manual_plan_id,
-                "trade_plan_id": log.trade_plan_id,
-                "position_id": log.position_id,
-            }
-        )
-    
-    # 处理持仓记录（包含完整的退出信息）
-    for pos in positions:
-        # 计算盈亏
-        pnl_pct = None
-        if pos.exit_price and pos.entry_price:
-            if pos.side == "BUY":
-                pnl_pct = float((pos.exit_price - pos.entry_price) / pos.entry_price * 100)
-            else:
-                pnl_pct = float((pos.entry_price - pos.exit_price) / pos.entry_price * 100)
+        positions = list(db.scalars(positions_stmt))
         
-        # 确定时间戳（优先使用退出时间，否则使用入场时间）
-        timestamp = pos.exit_time.isoformat() if pos.exit_time else (pos.entry_time.isoformat() if pos.entry_time else None)
+        # 构建历史记录
+        # 处理执行日志
+        for log in logs:
+            history.append(
+                {
+                    "type": "execution_log",
+                    "id": log.id,
+                    "event_type": log.event_type,
+                    "symbol": log.symbol,
+                    "side": log.side,
+                    "price": float(log.price) if log.price else None,
+                    "quantity": float(log.quantity) if log.quantity else None,
+                    "order_id": log.order_id,
+                    "status": log.status,
+                    "timestamp": log.created_at.isoformat() if log.created_at else None,
+                    "payload": log.payload,
+                    "manual_plan_id": log.manual_plan_id,
+                    "trade_plan_id": log.trade_plan_id,
+                    "position_id": log.position_id,
+                }
+            )
         
-        history.append({
-            "type": "position",
-            "id": pos.id,
-            "symbol": pos.symbol,
-            "side": pos.side,
-            "entry_price": float(pos.entry_price) if pos.entry_price else None,
-            "exit_price": float(pos.exit_price) if pos.exit_price else None,
-            "entry_quantity": float(pos.entry_quantity) if pos.entry_quantity else None,
-            "exit_quantity": float(pos.exit_quantity) if pos.exit_quantity else None,
-            "entry_time": pos.entry_time.isoformat() if pos.entry_time else None,
-            "exit_time": pos.exit_time.isoformat() if pos.exit_time else None,
-            "timestamp": timestamp,  # 添加timestamp字段，用于排序
-            "exit_reason": pos.exit_reason,  # 退出原因：stop_loss, trailing_stop, external_closed, manual
-            "leverage": float(pos.leverage) if pos.leverage else None,
-            "stop_loss_pct": float(pos.stop_loss_pct) if pos.stop_loss_pct else None,
-            "trailing_exit_pct": float(pos.trailing_exit_pct) if pos.trailing_exit_pct else None,
-            "highest_price": float(pos.highest_price) if pos.highest_price else None,
-            "lowest_price": float(pos.lowest_price) if pos.lowest_price else None,
-            "pnl_pct": pnl_pct,
-            "is_external": pos.is_external,
-            "manual_plan_id": str(pos.manual_plan_id) if pos.manual_plan_id else None,
-            "trade_plan_id": str(pos.trade_plan_id) if pos.trade_plan_id else None,
-            "order_id": None,  # 持仓记录没有order_id，使用None
-        })
-    
-    # 按时间排序（最新的在前）
-    history.sort(key=lambda x: x.get("timestamp") or x.get("exit_time") or x.get("entry_time") or "", reverse=True)
-    
-    return {
-        "total": len(history),
-        "history": history[:limit],  # 确保不超过limit
-    }
+        # 处理持仓记录（包含完整的退出信息）
+        for pos in positions:
+            # 计算盈亏百分比和盈亏金额（USDT）
+            pnl_pct = None
+            pnl_value = None  # 盈亏金额（USDT）
+            if pos.exit_price and pos.entry_price:
+                if pos.side == "BUY":
+                    pnl_pct = float((pos.exit_price - pos.entry_price) / pos.entry_price * 100)
+                else:
+                    pnl_pct = float((pos.entry_price - pos.exit_price) / pos.entry_price * 100)
+                
+                # 计算盈亏金额（USDT）
+                # 使用退出数量（如果有），否则使用入场数量
+                # 先将 Decimal 转换为 float，避免类型混合运算错误
+                entry_price_float = float(pos.entry_price)
+                exit_price_float = float(pos.exit_price)
+                quantity = float(pos.exit_quantity) if pos.exit_quantity and pos.exit_quantity > 0 else float(pos.entry_quantity)
+                
+                if pos.side == "BUY":
+                    # 做多：盈亏 = (退出价 - 入场价) * 数量
+                    pnl_value = (exit_price_float - entry_price_float) * quantity
+                else:
+                    # 做空：盈亏 = (入场价 - 退出价) * 数量
+                    pnl_value = (entry_price_float - exit_price_float) * quantity
+            
+            # 确定时间戳（优先使用退出时间，否则使用入场时间）
+            timestamp = pos.exit_time.isoformat() if pos.exit_time else (pos.entry_time.isoformat() if pos.entry_time else None)
+            
+            history.append({
+                "type": "position",
+                "id": pos.id,
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "entry_price": float(pos.entry_price) if pos.entry_price else None,
+                "exit_price": float(pos.exit_price) if pos.exit_price else None,
+                "entry_quantity": float(pos.entry_quantity) if pos.entry_quantity else None,
+                "exit_quantity": float(pos.exit_quantity) if pos.exit_quantity else None,
+                "entry_time": pos.entry_time.isoformat() if pos.entry_time else None,
+                "exit_time": pos.exit_time.isoformat() if pos.exit_time else None,
+                "timestamp": timestamp,  # 添加timestamp字段，用于排序
+                "exit_reason": pos.exit_reason,  # 退出原因：stop_loss, trailing_stop, external_closed, manual
+                "leverage": float(pos.leverage) if pos.leverage else None,
+                "stop_loss_pct": float(pos.stop_loss_pct) if pos.stop_loss_pct else None,
+                "trailing_exit_pct": float(pos.trailing_exit_pct) if pos.trailing_exit_pct else None,
+                "highest_price": float(pos.highest_price) if pos.highest_price else None,
+                "lowest_price": float(pos.lowest_price) if pos.lowest_price else None,
+                "pnl_pct": pnl_pct,  # 盈亏百分比
+                "pnl_value": pnl_value,  # 盈亏金额（USDT）
+                "is_external": pos.is_external,
+                "manual_plan_id": str(pos.manual_plan_id) if pos.manual_plan_id else None,
+                "trade_plan_id": str(pos.trade_plan_id) if pos.trade_plan_id else None,
+                "order_id": None,  # 持仓记录没有order_id，使用None
+            })
+        
+        # 按时间排序（最新的在前）
+        history.sort(key=lambda x: x.get("timestamp") or x.get("exit_time") or x.get("entry_time") or "", reverse=True)
+        
+        return {
+            "total": len(history),
+            "history": history[:limit],  # 确保不超过limit
+        }
+    except Exception as exc:
+        logger.error("获取交易历史记录失败: {}", exc, exc_info=True)
+        # 返回空结果而不是抛出异常，让前端可以显示错误信息
+        return {
+            "total": 0,
+            "history": [],
+            "error": str(exc)
+        }
 
 
 @router.put("/positions/{position_id}/exit-params")

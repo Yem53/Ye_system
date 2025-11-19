@@ -63,13 +63,35 @@ def on_shutdown() -> None:
     """优雅关闭调度器和WebSocket服务"""
     logger.info("正在关闭调度器和相关服务…")
     
-    # 关闭调度器
+    # 关闭调度器（先停止调度，再关闭线程池）
     if scheduler.running:
         try:
-            scheduler.shutdown(wait=True)  # wait=True 等待所有任务完成
+            scheduler.shutdown(wait=False)  # wait=False 不等待任务完成，避免阻塞
             logger.info("调度器已关闭")
         except Exception as exc:
             logger.warning("关闭调度器时出错: {}", exc)
+    
+    # 关闭线程池执行器（等待正在执行的任务完成）
+    try:
+        from app.core.scheduler import _monitor_executor, _sync_executor, _precision_threads
+        
+        # 等待监控和同步线程池关闭
+        logger.info("正在关闭线程池执行器…")
+        _monitor_executor.shutdown(wait=True)
+        _sync_executor.shutdown(wait=True)
+        logger.info("线程池执行器已关闭")
+        
+        # 等待精确执行线程完成（最多等待2秒）
+        if _precision_threads:
+            logger.info("正在等待 {} 个精确执行线程完成…", len(_precision_threads))
+            for plan_id, thread in list(_precision_threads.items()):
+                if thread.is_alive():
+                    thread.join(timeout=2)
+                    if thread.is_alive():
+                        logger.warning("精确执行线程 {} 未能在2秒内完成，强制继续关闭", plan_id)
+            logger.info("精确执行线程已清理")
+    except Exception as exc:
+        logger.warning("关闭线程池时出错: {}", exc)
     
     # 关闭WebSocket服务
     if settings.websocket_price_enabled:

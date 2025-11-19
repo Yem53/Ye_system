@@ -40,7 +40,7 @@ logger.info("线程池配置: 监控任务={}个工作线程, 同步任务={}个
 # 动态刷新频率状态（模块级别变量）
 MIN_MANUAL_EXECUTOR_INTERVAL: float = 0.3  # 避免调度器堆积的最小间隔
 MIN_POSITION_MONITOR_INTERVAL: float = 0.5  # 持仓监控的最小间隔（秒），保证高精度
-MONITOR_TIMEOUT: float = 0.4  # 监控任务超时阈值（秒），超过此时间认为可能有问题
+MONITOR_TIMEOUT: float = 0.5  # 监控任务超时阈值（秒），设置为与最小监控间隔一致，避免正常执行被误判为超时
 _current_position_monitor_interval: float = MIN_POSITION_MONITOR_INTERVAL  # 初始值：使用最小间隔
 _current_manual_executor_interval: float = MIN_MANUAL_EXECUTOR_INTERVAL  # 初始值：使用最小间隔
 _last_binance_sync_ts: float = 0.0  # 上次同步币安持仓的时间戳
@@ -48,6 +48,9 @@ _monitor_positions_running: bool = False  # 标记 monitor_positions 是否正�
 _monitor_start_time: float = 0.0  # 监控任务开始时间（用于超时检测）
 _sync_positions_running: bool = False  # 标记 sync_positions_from_binance 是否正在执行
 _sync_start_time: float = 0.0  # 同步任务开始时间
+_manual_executor_running: bool = False  # 标记手动计划执行器是否正在运行
+_manual_executor_start_time: float = 0.0  # 手动计划执行任务开始时间
+MANUAL_EXECUTOR_TIMEOUT: float = 1.5  # 手动计划执行器超时阈值（秒）
 
 
 def start_scheduler() -> None:
@@ -61,7 +64,7 @@ def start_scheduler() -> None:
     check_interval = max(raw_manual_interval, MIN_MANUAL_EXECUTOR_INTERVAL)
     if check_interval != raw_manual_interval:
         logger.warning(
-            "配置 manual_plan_check_interval=%.3f 秒过低，已自动提升到 %.3f 秒以避免调度器实例堆积",
+            "配置 manual_plan_check_interval={:.3f} 秒过低，已自动提升到 {:.3f} 秒以避免调度器实例堆积",
             raw_manual_interval,
             check_interval,
         )
@@ -70,11 +73,24 @@ def start_scheduler() -> None:
     def execute_manual_plans() -> None:
         """执行手动计划，支持精确模式（毫秒级精度）"""
         from datetime import datetime, timezone
+        global _manual_executor_running, _manual_executor_start_time
         
         # 检查调度器是否还在运行，避免在关闭后执行
         if not scheduler.running:
             logger.debug("调度器已关闭，跳过手动计划执行任务")
             return
+        
+        if _manual_executor_running:
+            elapsed = time.time() - _manual_executor_start_time
+            if elapsed > MANUAL_EXECUTOR_TIMEOUT:
+                logger.warning("手动计划执行任务超时（{:.2f}秒），强制重置", elapsed)
+                _manual_executor_running = False
+            else:
+                logger.debug("手动计划执行任务仍在进行中，跳过本次调度")
+                return
+        
+        _manual_executor_running = True
+        _manual_executor_start_time = time.time()
         
         try:
             with SessionLocal() as db:
@@ -151,7 +167,7 @@ def start_scheduler() -> None:
                             if settings.websocket_price_enabled:
                                 try:
                                     ws_service.subscribe_symbol(symbol)
-                                    logger.debug("计划 %s 提前订阅WebSocket: %s (距离执行还有 %.1f 分钟)", 
+                                    logger.debug("计划 {} 提前订阅WebSocket: {} (距离执行还有 {:.1f} 分钟)", 
                                                plan.id, symbol, time_diff / 60)
                                 except Exception as exc:
                                     logger.warning("订阅WebSocket失败 ({}): {}", symbol, exc)
@@ -159,7 +175,7 @@ def start_scheduler() -> None:
                         # 如果计划在精确模式阈值内，且尚未启动精确执行线程
                         if 0 < time_diff <= settings.manual_plan_precision_threshold:
                             if plan.id not in _precision_threads or not _precision_threads[plan.id].is_alive():
-                                logger.info("计划 %s 将在 %.2f秒后执行，启动精确执行模式", plan.id, time_diff)
+                                logger.info("计划 {} 将在 {:.2f}秒后执行，启动精确执行模式", plan.id, time_diff)
                                 
                                 def precise_execute(plan_id: str, listing_time: datetime):
                                     """精确执行函数，在指定时间精确执行"""
@@ -217,7 +233,7 @@ def start_scheduler() -> None:
                                             try:
                                                 executor_exec.execute_manual_plan(plan_check)
                                                 service_exec.mark_status(plan_check, ManualPlanStatus.EXECUTED)
-                                                logger.info("计划 %s 精确执行完成，执行时间: %s，延迟: %.2f毫秒", 
+                                                logger.info("计划 {} 精确执行完成，执行时间: {}，延迟: {:.2f}毫秒", 
                                                           plan_id, actual_exec_time.isoformat(), delay)
                                             except Exception as exc:
                                                 logger.error("计划 %s 精确执行失败: %s", plan_id, exc, exc_info=True)
@@ -239,11 +255,12 @@ def start_scheduler() -> None:
                                 thread.start()
                                 _precision_threads[plan.id] = thread
         except Exception as exc:
-            # 如果调度器正在关闭，忽略错误
             if scheduler.running:
                 logger.error("手动计划执行任务失败: {}", exc, exc_info=True)
             else:
                 logger.debug("调度器关闭中，忽略手动计划执行错误")
+        finally:
+            _manual_executor_running = False
 
     if not scheduler.get_job("manual-executor"):
         scheduler.add_job(
@@ -252,10 +269,13 @@ def start_scheduler() -> None:
             seconds=check_interval,
             id="manual-executor",
             replace_existing=True,
-            max_instances=3,  # 允许最多3个并发实例，避免任务堆积
+            # 不设置 max_instances，使用默认值，通过数据库级别的原子更新防止并发问题
+            coalesce=True,  # 合并错过的执行
+            misfire_grace_time=1,  # 错过的任务在1秒内仍执行
+            max_instances=3,  # 允许并发启动，但内部有自定义互斥逻辑
         )
         logger.info(
-            "手动计划执行器已启动，检查间隔: %.3f秒（%d毫秒）",
+            "手动计划执行器已启动，检查间隔: {:.3f}秒（{}毫秒）",
             check_interval,
             int(check_interval * 1000),
         )
@@ -283,7 +303,7 @@ def start_scheduler() -> None:
         if _sync_positions_running:
             elapsed = time.time() - _sync_start_time
             if elapsed > 10.0:
-                logger.warning("同步任务执行超时（%.2f秒），强制重置", elapsed)
+                logger.warning("同步任务执行超时（{:.2f}秒），强制重置", elapsed)
                 _sync_positions_running = False
             else:
                 return
@@ -307,7 +327,7 @@ def start_scheduler() -> None:
             finally:
                 elapsed = time.time() - _sync_start_time
                 if elapsed > 5.0:
-                    logger.warning("同步任务执行时间过长: %.2f秒", elapsed)
+                    logger.warning("同步任务执行时间过长: {:.2f}秒", elapsed)
                 _sync_positions_running = False
         
         # 异步提交到线程池，不阻塞调度器
@@ -325,7 +345,7 @@ def start_scheduler() -> None:
         if _monitor_positions_running:
             elapsed = time.time() - _monitor_start_time
             if elapsed > MONITOR_TIMEOUT:
-                logger.warning("监控任务执行超时（%.2f秒），强制重置", elapsed)
+                logger.warning("监控任务执行超时（{:.2f}秒），强制重置", elapsed)
                 _monitor_positions_running = False
             else:
                 # 正常执行中，跳过本次（避免堆积）
@@ -361,7 +381,7 @@ def start_scheduler() -> None:
                                 trigger="interval",
                                 seconds=new_interval
                             )
-                            logger.info("持仓监控刷新频率已调整为: %.3f秒（%d毫秒） - %s", 
+                            logger.info("持仓监控刷新频率已调整为: {:.3f}秒（{}毫秒） - {}", 
                                       new_interval, int(new_interval * 1000),
                                       "高频模式" if has_positions else "正常模式")
             except Exception as exc:
@@ -370,7 +390,7 @@ def start_scheduler() -> None:
             finally:
                 elapsed = time.time() - _monitor_start_time
                 if elapsed > MONITOR_TIMEOUT:
-                    logger.warning("监控任务执行时间过长: %.2f秒（目标<%.2f秒）", elapsed, MONITOR_TIMEOUT)
+                    logger.warning("监控任务执行时间过长: {:.2f}秒（目标<{:.2f}秒）", elapsed, MONITOR_TIMEOUT)
                 _monitor_positions_running = False
         
         # 异步提交到线程池，不阻塞调度器
@@ -385,9 +405,11 @@ def start_scheduler() -> None:
             seconds=BINANCE_SYNC_INTERVAL,
             id="binance-sync",
             replace_existing=True,
-            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1,
+            max_instances=3,
         )
-        logger.info("币安持仓同步任务已启动，同步间隔: %.1f秒", BINANCE_SYNC_INTERVAL)
+        logger.info("币安持仓同步任务已启动，同步间隔: {:.1f}秒", BINANCE_SYNC_INTERVAL)
     
     # 注册高频持仓监控任务（快速执行，不包含同步操作）
     if not scheduler.get_job("position-monitor"):
@@ -398,9 +420,11 @@ def start_scheduler() -> None:
             seconds=initial_interval, 
             id="position-monitor", 
             replace_existing=True,
-            max_instances=1  # 只允许1个实例，通过 _monitor_positions_running 标志控制
+            coalesce=True,
+            misfire_grace_time=1,
+            max_instances=3,
         )
-        logger.info("持仓监控已启动，初始刷新频率: %.3f秒（%d毫秒）", 
+        logger.info("持仓监控已启动，初始刷新频率: {:.3f}秒（{}毫秒）", 
                   initial_interval, int(initial_interval * 1000))
         
         # 系统启动时立即同步一次币安持仓，确保监控所有持仓（包括非系统下单的）
