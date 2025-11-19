@@ -23,7 +23,9 @@
         
         /* 防止表格闪烁 - 保持最小高度，添加淡入淡出效果 */
         #positions-container {
-            min-height: 100px;
+            min-height: 220px;
+            max-height: 520px;
+            overflow-y: auto;
             transition: opacity 0.3s ease-in-out;
             will-change: opacity;
         }
@@ -47,10 +49,21 @@
             will-change: opacity;
         }
         
-        /* 防止布局抖动 - 固定表格布局 */
+        /* 持仓表格容器支持横向滚动 */
+        #positions-container .table-container {
+            overflow-x: auto;
+        }
+        
+        /* 持仓表格字体和间距优化 */
         #positions-container table {
-            table-layout: fixed;
             width: 100%;
+        }
+        
+        #positions-container table th,
+        #positions-container table td {
+            white-space: nowrap;
+            font-size: 0.85rem;
+            vertical-align: middle;
         }
         
         /* 单元格内容更新时不闪烁 */
@@ -58,6 +71,21 @@
             display: inline-block;
             min-width: 1em;
             transition: color 0.3s ease;
+        }
+
+        .pnl-daily-list {
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 0.85rem;
+            line-height: 1.4;
+        }
+
+        .pnl-daily-list .pnl-positive {
+            color: #23d160;
+        }
+
+        .pnl-daily-list .pnl-negative {
+            color: #ff3860;
         }
     </style>
 </head>

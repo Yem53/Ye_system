@@ -9,118 +9,18 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.announcement import Announcement
-from app.models.enums import AnnouncementStatus, ManualPlanStatus, PositionStatus
+from app.models.enums import ManualPlanStatus, PositionStatus
 from app.models.execution_log import ExecutionLog
 from app.models.manual_plan import ManualPlan
 from app.models.position import Position
-from app.schemas.announcement import AnnouncementRead
 from app.schemas.manual_plan import ManualPlanCreate, ManualPlanRead
-from app.schemas.trade_plan import TradePlanRead
-from app.services.backfill_service import AnnouncementBackfillService
 from app.services.binance_service import BinanceFuturesClient
 from app.services.manual_plan_service import ManualPlanService
 from app.services.position_service import PositionService
-from app.services.trade_service import TradeService
-from app.services.window_return_service import WindowReturnService
 from app.services.websocket_service import websocket_manager
 from app.core.config import get_settings
 
 router = APIRouter(prefix="/api", tags=["Dashboard / 仪表盘"])
-
-
-@router.get("/announcements", response_model=list[AnnouncementRead])
-def list_announcements(db: Session = Depends(get_db)):
-    """获取公告列表 / Get Announcements List"""
-    from sqlalchemy import select
-
-    stmt = select(Announcement).order_by(Announcement.created_at.desc()).limit(100)
-    return list(db.scalars(stmt))
-
-
-@router.post("/announcements/fetch-now")
-def fetch_announcements_now(db: Session = Depends(get_db)):
-    """立即触发公告抓取（用于测试和手动刷新） / Trigger Announcement Fetch Now (for testing and manual refresh)"""
-    try:
-        from app.services.announcement_service import AnnouncementService
-        from app.core.config import get_settings
-        
-        settings = get_settings()
-        service = AnnouncementService(db, settings)
-        new_records = service.sync_from_sources()
-        
-        return {
-            "success": True,
-            "message": f"成功抓取 {len(new_records)} 条新公告 / Successfully fetched {len(new_records)} new announcements",
-            "count": len(new_records),
-            "announcements": [
-                {
-                    "id": ann.id,
-                    "title": ann.title,
-                    "symbol": ann.symbol,
-                    "source": ann.source,
-                    "status": ann.status.value
-                }
-                for ann in new_records[:10]  # 只返回前10条
-            ]
-        }
-    except Exception as exc:
-        logger.error("手动抓取公告失败: {}", exc)
-        return {
-            "success": False,
-            "message": f"抓取失败: {str(exc)} / Fetch failed: {str(exc)}",
-            "count": 0
-        }
-
-
-@router.post("/announcements/{announcement_id}/approve", response_model=TradePlanRead)
-def approve_announcement(
-    announcement_id: str = Path(..., description="公告ID / Announcement ID"),
-    db: Session = Depends(get_db)
-):
-    """批准公告并创建交易计划 / Approve Announcement and Create Trade Plan"""
-    announcement = db.get(Announcement, announcement_id)
-    if not announcement:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="公告不存在 / Announcement not found")
-    service = TradeService(db)
-    plan = service.approve_announcement(announcement)
-    return plan
-
-
-@router.post("/announcements/{announcement_id}/reject", response_model=AnnouncementRead)
-def reject_announcement(
-    announcement_id: str = Path(..., description="公告ID / Announcement ID"),
-    db: Session = Depends(get_db)
-):
-    """拒绝公告 / Reject Announcement"""
-    announcement = db.get(Announcement, announcement_id)
-    if not announcement:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="公告不存在 / Announcement not found")
-    announcement.status = AnnouncementStatus.REJECTED
-    db.commit()
-    db.refresh(announcement)
-    return announcement
-
-
-@router.get("/trade-plans", response_model=list[TradePlanRead])
-def list_trade_plans(db: Session = Depends(get_db)):
-    """获取交易计划列表 / Get Trade Plans List"""
-    from sqlalchemy import select
-    from app.models.trade_plan import TradePlan
-
-    stmt = select(TradePlan).order_by(TradePlan.created_at.desc()).limit(100)
-    return list(db.scalars(stmt))
-
-
-@router.post("/backfill")
-def trigger_backfill(
-    months: int = Query(6, description="抓取最近几个月的历史公告（默认6个月） / Number of months to fetch (default: 6)"),
-    db: Session = Depends(get_db)
-):
-    """抓取历史公告（旧版API，建议使用 /backfill/announcements） / Fetch Historical Announcements (Legacy)"""
-    service = AnnouncementBackfillService(db)
-    count = service.backfill(months=months)
-    return {"inserted": count}
 
 
 @router.get("/manual-plans", response_model=list[ManualPlanRead])
@@ -220,6 +120,16 @@ def get_realtime_positions(db: Session = Depends(get_db)):
         })
     
     return result
+
+
+@router.get("/pnl/summary")
+def get_pnl_summary(
+    days: int = Query(30, ge=1, le=365, description="统计最近多少天的收益 / Number of days to include"),
+    db: Session = Depends(get_db)
+):
+    """获取每日收益与累计收益 / Get daily and cumulative PnL summary"""
+    service = PositionService(db)
+    return service.get_realized_pnl_summary(days=days)
 
 
 @router.get("/realtime/prices")
@@ -437,22 +347,28 @@ def get_trading_history(
     db: Session = Depends(get_db),
     limit: int = Query(100, description="返回记录数量 / Number of records to return"),
     offset: int = Query(0, description="偏移量 / Offset"),
+    include_logs: bool = Query(False, description="是否包含详细执行日志，默认仅返回已完成持仓"),
 ):
     """
     获取交易历史记录 / Get Trading History
     包括所有买入、退出记录及退出条件等信息
     """
-    from sqlalchemy import select, or_, desc
+    from sqlalchemy import desc, select
     from app.models.enums import PositionStatus
     
-    # 获取所有执行日志（买入、退出等）
-    logs_stmt = (
-        select(ExecutionLog)
-        .order_by(desc(ExecutionLog.created_at))
-        .limit(limit)
-        .offset(offset)
-    )
-    logs = list(db.scalars(logs_stmt))
+    history: list[dict] = []
+    allowed_log_events = {"order_filled", "position_closed"}
+
+    logs: list[ExecutionLog] = []
+    if include_logs:
+        logs_stmt = (
+            select(ExecutionLog)
+            .where(ExecutionLog.event_type.in_(allowed_log_events))
+            .order_by(desc(ExecutionLog.created_at))
+            .limit(limit)
+            .offset(offset)
+        )
+        logs = list(db.scalars(logs_stmt))
     
     # 获取所有已关闭的持仓（包含完整的退出信息）
     positions_stmt = (
@@ -465,26 +381,26 @@ def get_trading_history(
     positions = list(db.scalars(positions_stmt))
     
     # 构建历史记录
-    history = []
-    
     # 处理执行日志
     for log in logs:
-        history.append({
-            "type": "execution_log",
-            "id": log.id,
-            "event_type": log.event_type,
-            "symbol": log.symbol,
-            "side": log.side,
-            "price": float(log.price) if log.price else None,
-            "quantity": float(log.quantity) if log.quantity else None,
-            "order_id": log.order_id,
-            "status": log.status,
-            "timestamp": log.created_at.isoformat() if log.created_at else None,
-            "payload": log.payload,
-            "manual_plan_id": log.manual_plan_id,
-            "trade_plan_id": log.trade_plan_id,
-            "position_id": log.position_id,
-        })
+        history.append(
+            {
+                "type": "execution_log",
+                "id": log.id,
+                "event_type": log.event_type,
+                "symbol": log.symbol,
+                "side": log.side,
+                "price": float(log.price) if log.price else None,
+                "quantity": float(log.quantity) if log.quantity else None,
+                "order_id": log.order_id,
+                "status": log.status,
+                "timestamp": log.created_at.isoformat() if log.created_at else None,
+                "payload": log.payload,
+                "manual_plan_id": log.manual_plan_id,
+                "trade_plan_id": log.trade_plan_id,
+                "position_id": log.position_id,
+            }
+        )
     
     # 处理持仓记录（包含完整的退出信息）
     for pos in positions:
@@ -680,119 +596,6 @@ async def websocket_realtime(websocket: WebSocket):
     except Exception as exc:
         logger.error("WebSocket错误: {}", exc, exc_info=True)
         websocket_manager.disconnect(websocket)
-
-
-@router.post("/backfill/announcements")
-def backfill_announcements(
-    months: int = Query(6, description="抓取最近几个月的历史公告（默认6个月） / Number of months to fetch (default: 6)"),
-    max_pages: int = Query(100, description="每个数据源最多抓取多少页（默认100页） / Max pages per source (default: 100)"),
-    languages: str = Query("en", description="语言列表，用逗号分隔（默认 'en'，只抓取英文公告） / Language list, comma-separated (default: 'en')"),
-    db: Session = Depends(get_db)
-):
-    """抓取历史公告 / Fetch Historical Announcements"""
-    try:
-        # 解析语言列表
-        lang_list = [lang.strip() for lang in languages.split(",") if lang.strip()]
-        if not lang_list:
-            lang_list = ["en"]
-        
-        service = AnnouncementBackfillService(db)
-        count = service.backfill(months=months, max_pages=max_pages, languages=lang_list)
-        return {
-            "success": True,
-            "message": f"成功抓取 {count} 条历史公告（语言: {', '.join(lang_list)}）",
-            "count": count,
-            "languages": lang_list
-        }
-    except Exception as exc:
-        logger.error("抓取历史公告失败: {}", exc)
-        return {
-            "success": False,
-            "message": f"抓取失败: {str(exc)}",
-            "count": 0
-        }
-
-
-@router.post("/compute/returns")
-def compute_returns(
-    announcement_id: str | None = Query(None, description="可选，如果提供则只计算指定公告的收益，否则计算所有公告的收益 / Optional, compute returns for specific announcement or all if None"),
-    db: Session = Depends(get_db)
-):
-    """计算公告收益 / Compute Announcement Returns"""
-    try:
-        service = WindowReturnService(db)
-        if announcement_id:
-            from app.models.announcement import Announcement
-            announcement = db.get(Announcement, announcement_id)
-            if not announcement:
-                return {
-                    "success": False,
-                    "message": f"公告 {announcement_id} 不存在"
-                }
-            service.compute_for_announcement(announcement)
-            return {
-                "success": True,
-                "message": f"成功计算公告 {announcement_id} 的收益"
-            }
-        else:
-            service.run()
-            return {
-                "success": True,
-                "message": "成功计算所有公告的收益"
-            }
-    except Exception as exc:
-        logger.error("计算收益失败: {}", exc)
-        return {
-            "success": False,
-            "message": f"计算失败: {str(exc)}"
-        }
-
-
-@router.post("/backfill/announcements-and-returns")
-def backfill_announcements_and_returns(
-    months: int = Query(6, description="抓取最近几个月的历史公告（默认6个月） / Number of months to fetch (default: 6)"),
-    max_pages: int = Query(100, description="每个数据源最多抓取多少页（默认100页） / Max pages per source (default: 100)"),
-    languages: str = Query("en", description="语言列表，用逗号分隔（默认 'en'，只抓取英文公告） / Language list, comma-separated (default: 'en')"),
-    compute_returns_flag: bool = Query(True, description="是否在抓取后自动计算收益（默认True） / Auto-compute returns after fetching (default: True)"),
-    db: Session = Depends(get_db)
-):
-    """抓取历史公告并计算收益（一站式操作） / Fetch Historical Announcements and Compute Returns"""
-    try:
-        # 解析语言列表
-        lang_list = [lang.strip() for lang in languages.split(",") if lang.strip()]
-        if not lang_list:
-            lang_list = ["en"]
-        
-        # 1. 抓取历史公告
-        backfill_service = AnnouncementBackfillService(db)
-        announcement_count = backfill_service.backfill(months=months, max_pages=max_pages, languages=lang_list)
-        
-        # 2. 计算收益（如果启用）
-        return_count = 0
-        if compute_returns_flag:
-            return_service = WindowReturnService(db)
-            return_service.run()
-            # 统计计算了多少条收益记录
-            from app.models.announcement_return import AnnouncementReturn
-            from sqlalchemy import func, select
-            return_count = db.scalar(select(func.count(AnnouncementReturn.id))) or 0
-        
-        return {
-            "success": True,
-            "message": f"成功抓取 {announcement_count} 条历史公告（语言: {', '.join(lang_list)}）" + 
-                      (f"，已计算收益（共 {return_count} 条收益记录）" if compute_returns_flag else ""),
-            "announcement_count": announcement_count,
-            "return_count": return_count,
-            "languages": lang_list
-        }
-    except Exception as exc:
-        logger.error("抓取历史公告并计算收益失败: {}", exc)
-        return {
-            "success": False,
-            "message": f"操作失败: {str(exc)}",
-            "announcement_count": 0,
-            "return_count": 0
-        }
 
 
 @router.get("/settings")

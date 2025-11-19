@@ -7,7 +7,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from loguru import logger
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from app.api.routes import router as api_router
@@ -15,12 +14,9 @@ from app.core.config import get_settings
 from app.core.scheduler import scheduler, start_scheduler
 from app.db.init_db import init_db
 from app.db.session import get_db
-from app.models.announcement import Announcement
-from app.models.enums import AnnouncementStatus, ManualPlanStatus
+from app.models.enums import ManualPlanStatus
 from app.models.manual_plan import ManualPlan
-from app.models.trade_plan import TradePlan
 from app.services.manual_plan_service import ManualPlanService
-from app.services.trade_service import TradeService
 
 settings = get_settings()
 
@@ -113,27 +109,14 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 @app.get("/history", response_class=HTMLResponse)
 def history_page(request: Request, db: Session = Depends(get_db)):
     """历史操作记录页面 / Trading History Page"""
-    return templates.TemplateResponse("history.html", {"request": request})
-
-
-@app.post("/announcements/{announcement_id}/approve")
-def approve_announcement(announcement_id: str, db: Session = Depends(get_db)):
-    announcement = db.get(Announcement, announcement_id)
-    if not announcement:
-        raise HTTPException(status_code=404, detail="公告不存在")
-    service = TradeService(db)
-    service.approve_announcement(announcement)
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/announcements/{announcement_id}/reject")
-def reject_announcement(announcement_id: str, db: Session = Depends(get_db)):
-    announcement = db.get(Announcement, announcement_id)
-    if not announcement:
-        raise HTTPException(status_code=404, detail="公告不存在")
-    announcement.status = AnnouncementStatus.REJECTED
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
+    current_settings = get_settings()
+    return templates.TemplateResponse(
+        "history.html",
+        {
+            "request": request,
+            "settings": current_settings,
+        },
+    )
 
 
 @app.post("/manual-plans")
@@ -197,22 +180,3 @@ def cancel_manual_plan(plan_id: str, db: Session = Depends(get_db)):
     
     return RedirectResponse(url="/", status_code=303)
 
-
-@app.post("/trade-plans/{plan_id}/update")
-def update_trade_plan(
-    plan_id: str,
-    leverage: float = Form(...),
-    position_pct: float = Form(...),
-    trailing_exit_pct: float = Form(...),
-    stop_loss_pct: float = Form(...),
-    db: Session = Depends(get_db),
-):
-    plan = db.get(TradePlan, plan_id)
-    if not plan:
-        raise HTTPException(status_code=404, detail="交易计划不存在")
-    plan.leverage = leverage
-    plan.position_pct = position_pct
-    plan.trailing_exit_pct = trailing_exit_pct
-    plan.stop_loss_pct = stop_loss_pct
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)

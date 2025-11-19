@@ -1,6 +1,7 @@
-import asyncio
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
@@ -8,13 +9,9 @@ from loguru import logger
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.enums import ManualPlanStatus
-from app.services.announcement_service import AnnouncementService
-from app.services.analytics_service import HistoricalAnalyzer
 from app.services.execution_service import ExecutionService
 from app.services.manual_plan_service import ManualPlanService
 from app.services.position_service import PositionService
-from app.services.report_service import DailyReporter
-from app.services.window_return_service import WindowReturnService
 
 # APScheduler 持续在后台触发公告抓取与日报发送任务
 scheduler = BackgroundScheduler(timezone="UTC")
@@ -22,9 +19,35 @@ scheduler = BackgroundScheduler(timezone="UTC")
 # 用于跟踪已启动精确执行线程的计划，避免重复启动
 _precision_threads: dict[str, threading.Thread] = {}
 
+# 动态线程池大小（根据CPU核心数优化资源利用）
+CPU_COUNT = os.cpu_count() or 4
+MONITOR_WORKERS = max(4, CPU_COUNT)  # 至少4个，最多等于CPU核心数（充分利用多核）
+SYNC_WORKERS = max(2, CPU_COUNT // 2)  # 同步任务使用一半核心数
+
+# 线程池执行器（用于异步执行监控任务，避免阻塞调度器）
+_monitor_executor = ThreadPoolExecutor(
+    max_workers=MONITOR_WORKERS, 
+    thread_name_prefix="position-monitor"
+)
+_sync_executor = ThreadPoolExecutor(
+    max_workers=SYNC_WORKERS, 
+    thread_name_prefix="binance-sync"
+)
+
+logger.info("线程池配置: 监控任务={}个工作线程, 同步任务={}个工作线程 (CPU核心数={})", 
+          MONITOR_WORKERS, SYNC_WORKERS, CPU_COUNT)
+
 # 动态刷新频率状态（模块级别变量）
-_current_position_monitor_interval: float = 1.0  # 初始值：1秒
-_current_manual_executor_interval: float = 0.1  # 初始值：100ms
+MIN_MANUAL_EXECUTOR_INTERVAL: float = 0.3  # 避免调度器堆积的最小间隔
+MIN_POSITION_MONITOR_INTERVAL: float = 0.5  # 持仓监控的最小间隔（秒），保证高精度
+MONITOR_TIMEOUT: float = 0.4  # 监控任务超时阈值（秒），超过此时间认为可能有问题
+_current_position_monitor_interval: float = MIN_POSITION_MONITOR_INTERVAL  # 初始值：使用最小间隔
+_current_manual_executor_interval: float = MIN_MANUAL_EXECUTOR_INTERVAL  # 初始值：使用最小间隔
+_last_binance_sync_ts: float = 0.0  # 上次同步币安持仓的时间戳
+_monitor_positions_running: bool = False  # 标记 monitor_positions 是否正在执行
+_monitor_start_time: float = 0.0  # 监控任务开始时间（用于超时检测）
+_sync_positions_running: bool = False  # 标记 sync_positions_from_binance 是否正在执行
+_sync_start_time: float = 0.0  # 同步任务开始时间
 
 
 def start_scheduler() -> None:
@@ -34,53 +57,15 @@ def start_scheduler() -> None:
     if not scheduler.running:
         scheduler.start()
 
-    def poll_announcements() -> None:
-        """轮询币安公告，保存到数据库并等待人工审核。"""
-        try:
-            with SessionLocal() as db:
-                service = AnnouncementService(db, settings)
-                new_records = service.sync_from_sources()
-                if new_records:
-                    logger.info("新增公告 %s 条", len(new_records))
-                else:
-                    logger.debug("本次轮询未发现新公告")
-        except Exception as exc:
-            logger.error("公告轮询失败: %s", exc, exc_info=True)
-
-    if not scheduler.get_job("announcement-poll"):
-        scheduler.add_job(
-            poll_announcements,
-            "interval",
-            seconds=settings.announcement_poll_interval,
-            id="announcement-poll",
-            replace_existing=True,
+    raw_manual_interval = settings.manual_plan_check_interval
+    check_interval = max(raw_manual_interval, MIN_MANUAL_EXECUTOR_INTERVAL)
+    if check_interval != raw_manual_interval:
+        logger.warning(
+            "配置 manual_plan_check_interval=%.3f 秒过低，已自动提升到 %.3f 秒以避免调度器实例堆积",
+            raw_manual_interval,
+            check_interval,
         )
 
-    def send_daily_report() -> None:
-        """每天 UTC 00:05 构建日报并发送到邮箱（若 SMTP 已配置）。"""
-
-        with SessionLocal() as db:
-            reporter = DailyReporter(db, settings)
-            asyncio.run(reporter.build_and_send())
-
-    if not scheduler.get_job("daily-report"):
-        scheduler.add_job(send_daily_report, "cron", hour=0, minute=5, id="daily-report", replace_existing=True)
-
-    def run_history_analysis() -> None:
-        with SessionLocal() as db:
-            analyzer = HistoricalAnalyzer(db, settings)
-            analyzer.sync_pending()
-
-    if not scheduler.get_job("analysis"):
-        scheduler.add_job(run_history_analysis, "interval", minutes=30, id="analysis", replace_existing=True)
-
-    def run_window_returns() -> None:
-        with SessionLocal() as db:
-            service = WindowReturnService(db, settings)
-            service.run()
-
-    if not scheduler.get_job("window-returns"):
-        scheduler.add_job(run_window_returns, "interval", minutes=60, id="window-returns", replace_existing=True)
 
     def execute_manual_plans() -> None:
         """执行手动计划，支持精确模式（毫秒级精度）"""
@@ -261,99 +246,164 @@ def start_scheduler() -> None:
                 logger.debug("调度器关闭中，忽略手动计划执行错误")
 
     if not scheduler.get_job("manual-executor"):
-        check_interval = settings.manual_plan_check_interval
         scheduler.add_job(
-            execute_manual_plans, 
-            "interval", 
-            seconds=check_interval, 
-            id="manual-executor", 
+            execute_manual_plans,
+            "interval",
+            seconds=check_interval,
+            id="manual-executor",
             replace_existing=True,
-            max_instances=3  # 允许最多3个并发实例，避免任务堆积
+            max_instances=3,  # 允许最多3个并发实例，避免任务堆积
         )
-        logger.info("手动计划执行器已启动，检查间隔: %.3f秒（%d毫秒）", check_interval, int(check_interval * 1000))
+        logger.info(
+            "手动计划执行器已启动，检查间隔: %.3f秒（%d毫秒）",
+            check_interval,
+            int(check_interval * 1000),
+        )
 
-    # 动态刷新频率配置
-    HIGH_FREQ_INTERVAL = 0.2  # 有持仓时：200ms
-    NORMAL_FREQ_INTERVAL = 1.0  # 无持仓时：1秒
+    # 动态刷新频率配置 - 分离监控和同步任务，保证高精度监控
+    HIGH_FREQ_INTERVAL = 0.5  # 有持仓时：500ms（高精度监控，不包含同步操作）
+    NORMAL_FREQ_INTERVAL = 2.0  # 无持仓时：2秒（减少不必要的检查）
+    BINANCE_SYNC_INTERVAL = 5.0  # 同步币安持仓的间隔（秒），独立任务，不阻塞监控
     
     # 初始化手动执行器间隔
-    _current_manual_executor_interval = settings.manual_plan_check_interval
+    global _current_manual_executor_interval, _last_binance_sync_ts, _monitor_positions_running, _sync_positions_running
+    _current_manual_executor_interval = check_interval
+    _last_binance_sync_ts = 0.0
+    _monitor_positions_running = False
+    _sync_positions_running = False
 
-    def monitor_positions() -> None:
-        """实时监控持仓并执行退出策略，动态调整刷新频率"""
-        global _current_position_monitor_interval, _current_manual_executor_interval
+    def sync_positions_from_binance() -> None:
+        """独立的任务：同步币安持仓（低频，不阻塞监控，异步执行）"""
+        global _last_binance_sync_ts, _sync_positions_running, _sync_start_time
         
-        # 检查调度器是否还在运行，避免在关闭后执行
         if not scheduler.running:
-            logger.debug("调度器已关闭，跳过持仓监控任务")
             return
         
-        try:
-            with SessionLocal() as db:
-                service = PositionService(db, settings)
-                
-                # 执行监控（包含同步币安持仓，确保监控所有持仓包括非系统下单的）
-                # 每次监控时同步一次，但频率不要太高（避免API限流）
-                # 这里每次都会同步，但sync_positions_from_binance内部有错误处理，不会影响监控
-                service.monitor_positions(sync_from_binance=True)
-                
-                # 获取活跃持仓数量（用于动态调整刷新频率）
-                active_positions = service.get_active_positions()
-                has_positions = len(active_positions) > 0
-                
-                # 动态调整刷新频率
-                new_interval = HIGH_FREQ_INTERVAL if has_positions else NORMAL_FREQ_INTERVAL
-                
-                # 如果频率需要改变，更新所有相关任务
-                if new_interval != _current_position_monitor_interval:
-                    _current_position_monitor_interval = new_interval
-                    
-                    # 更新持仓监控任务
-                    position_job = scheduler.get_job("position-monitor")
-                    if position_job:
-                        scheduler.reschedule_job(
-                            "position-monitor",
-                            trigger="interval",
-                            seconds=new_interval
-                        )
-                        logger.info("持仓监控刷新频率已调整为: %.3f秒（%d毫秒） - %s", 
-                                  new_interval, int(new_interval * 1000),
-                                  "高频模式" if has_positions else "正常模式")
-                    
-                    # 更新手动计划执行器（有持仓时也提高频率）
-                    manual_job = scheduler.get_job("manual-executor")
-                    if manual_job:
-                        new_manual_interval = HIGH_FREQ_INTERVAL if has_positions else settings.manual_plan_check_interval
-                        if new_manual_interval != _current_manual_executor_interval:
-                            _current_manual_executor_interval = new_manual_interval
-                            scheduler.reschedule_job(
-                                "manual-executor",
-                                trigger="interval",
-                                seconds=new_manual_interval
-                            )
-                            logger.info("手动计划执行器刷新频率已调整为: %.3f秒（%d毫秒）", 
-                                      new_manual_interval, int(new_manual_interval * 1000))
-        except Exception as exc:
-            # 如果调度器正在关闭，忽略错误
-            if scheduler.running:
-                logger.error("持仓监控任务执行失败: {}", exc, exc_info=True)
+        # 检查上次同步是否超时（超过10秒认为超时）
+        if _sync_positions_running:
+            elapsed = time.time() - _sync_start_time
+            if elapsed > 10.0:
+                logger.warning("同步任务执行超时（%.2f秒），强制重置", elapsed)
+                _sync_positions_running = False
             else:
-                logger.debug("调度器关闭中，忽略持仓监控错误")
+                return
+        
+        _sync_positions_running = True
+        _sync_start_time = time.time()
+        
+        def _execute_sync():
+            global _sync_positions_running, _last_binance_sync_ts
+            try:
+                with SessionLocal() as db:
+                    service = PositionService(db, settings)
+                    sync_result = service.sync_positions_from_binance()
+                    _last_binance_sync_ts = time.time()
+                    if sync_result["created"] > 0 or sync_result["updated"] > 0 or sync_result["closed"] > 0:
+                        logger.debug("同步币安持仓: 创建={} 更新={} 关闭={}", 
+                                   sync_result["created"], sync_result["updated"], sync_result["closed"])
+            except Exception as exc:
+                if scheduler.running:
+                    logger.warning("同步币安持仓失败: {}", exc)
+            finally:
+                elapsed = time.time() - _sync_start_time
+                if elapsed > 5.0:
+                    logger.warning("同步任务执行时间过长: %.2f秒", elapsed)
+                _sync_positions_running = False
+        
+        # 异步提交到线程池，不阻塞调度器
+        _sync_executor.submit(_execute_sync)
 
+    def monitor_positions() -> None:
+        """高频监控持仓并执行退出策略（异步执行，不阻塞调度器）"""
+        global _current_position_monitor_interval, _current_manual_executor_interval
+        global _monitor_positions_running, _monitor_start_time
+        
+        if not scheduler.running:
+            return
+        
+        # 检查上次任务是否超时（超过400ms认为可能有问题）
+        if _monitor_positions_running:
+            elapsed = time.time() - _monitor_start_time
+            if elapsed > MONITOR_TIMEOUT:
+                logger.warning("监控任务执行超时（%.2f秒），强制重置", elapsed)
+                _monitor_positions_running = False
+            else:
+                # 正常执行中，跳过本次（避免堆积）
+                return
+        
+        _monitor_positions_running = True
+        _monitor_start_time = time.time()
+        
+        def _execute_monitor():
+            global _monitor_positions_running, _current_position_monitor_interval
+            try:
+                with SessionLocal() as db:
+                    service = PositionService(db, settings)
+                    
+                    # 只监控，不同步（同步由独立任务处理）
+                    service.monitor_positions(sync_from_binance=False)
+                    
+                    # 获取活跃持仓数量（用于动态调整刷新频率）
+                    active_positions = service.get_active_positions()
+                    has_positions = len(active_positions) > 0
+                    
+                    # 动态调整刷新频率
+                    base_interval = HIGH_FREQ_INTERVAL if has_positions else NORMAL_FREQ_INTERVAL
+                    new_interval = max(base_interval, MIN_POSITION_MONITOR_INTERVAL)
+                    
+                    # 如果频率需要改变，更新任务
+                    if new_interval != _current_position_monitor_interval:
+                        _current_position_monitor_interval = new_interval
+                        position_job = scheduler.get_job("position-monitor")
+                        if position_job:
+                            scheduler.reschedule_job(
+                                "position-monitor",
+                                trigger="interval",
+                                seconds=new_interval
+                            )
+                            logger.info("持仓监控刷新频率已调整为: %.3f秒（%d毫秒） - %s", 
+                                      new_interval, int(new_interval * 1000),
+                                      "高频模式" if has_positions else "正常模式")
+            except Exception as exc:
+                if scheduler.running:
+                    logger.error("持仓监控任务执行失败: {}", exc, exc_info=True)
+            finally:
+                elapsed = time.time() - _monitor_start_time
+                if elapsed > MONITOR_TIMEOUT:
+                    logger.warning("监控任务执行时间过长: %.2f秒（目标<%.2f秒）", elapsed, MONITOR_TIMEOUT)
+                _monitor_positions_running = False
+        
+        # 异步提交到线程池，不阻塞调度器
+        # 这样即使执行时间较长，也不会影响下一次调度
+        _monitor_executor.submit(_execute_monitor)
+
+    # 注册独立的币安持仓同步任务（低频，不阻塞监控）
+    if not scheduler.get_job("binance-sync"):
+        scheduler.add_job(
+            sync_positions_from_binance,
+            "interval",
+            seconds=BINANCE_SYNC_INTERVAL,
+            id="binance-sync",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info("币安持仓同步任务已启动，同步间隔: %.1f秒", BINANCE_SYNC_INTERVAL)
+    
+    # 注册高频持仓监控任务（快速执行，不包含同步操作）
     if not scheduler.get_job("position-monitor"):
+        initial_interval = max(HIGH_FREQ_INTERVAL, MIN_POSITION_MONITOR_INTERVAL)
         scheduler.add_job(
             monitor_positions, 
             "interval", 
-            seconds=_current_position_monitor_interval, 
+            seconds=initial_interval, 
             id="position-monitor", 
             replace_existing=True,
-            max_instances=3  # 允许最多3个并发实例，避免任务堆积
+            max_instances=1  # 只允许1个实例，通过 _monitor_positions_running 标志控制
         )
         logger.info("持仓监控已启动，初始刷新频率: %.3f秒（%d毫秒）", 
-                  _current_position_monitor_interval, int(_current_position_monitor_interval * 1000))
+                  initial_interval, int(initial_interval * 1000))
         
         # 系统启动时立即同步一次币安持仓，确保监控所有持仓（包括非系统下单的）
-        # 这样即使系统意外中断并重启，也能立即恢复监控
         try:
             with SessionLocal() as db:
                 service = PositionService(db, settings)

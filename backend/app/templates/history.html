@@ -1,5 +1,21 @@
 {% extends "base.html" %}
 {% block content %}
+<style>
+    .history-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: flex-end;
+        margin-bottom: 1rem;
+    }
+    .history-toolbar .field {
+        margin-bottom: 0;
+    }
+    .history-toolbar .buttons {
+        display: flex;
+        gap: 0.5rem;
+    }
+</style>
 <div class="container" style="margin-top: 2rem;">
     <div class="card">
         <header class="card-header">
@@ -9,15 +25,18 @@
             </div>
         </header>
         <div class="card-content">
-            <div class="field is-grouped" style="margin-bottom: 1rem;">
-                <div class="control">
-                    <input class="input" type="number" id="limit-input" value="100" min="10" max="1000" step="10">
+            <div class="history-toolbar">
+                <div class="field has-addons">
+                    <p class="control">
+                        <span class="button is-static is-small">记录数 / Limit</span>
+                    </p>
+                    <p class="control">
+                        <input class="input is-small" type="number" id="limit-input" value="100" min="10" max="1000" step="10">
+                    </p>
                 </div>
-                <div class="control">
-                    <button class="button is-primary" onclick="loadHistory()">加载记录 / Load Records</button>
-                </div>
-                <div class="control">
-                    <button class="button is-light" onclick="exportHistory()">导出CSV / Export CSV</button>
+                <div class="buttons">
+                    <button class="button is-primary is-small" onclick="loadHistory()">加载记录 / Load Records</button>
+                    <button class="button is-light is-small" onclick="exportHistory()">导出CSV / Export CSV</button>
                 </div>
             </div>
             
@@ -37,7 +56,11 @@ async function loadHistory() {
     
     try {
         container.innerHTML = '<p>加载中... / Loading...</p>';
-        const response = await fetch(`/api/history?limit=${limit}`);
+        const response = await fetch(`/api/history?limit=${limit}`, { cache: 'no-cache' });
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(errorText || `HTTP ${response.status}`);
+        }
         const data = await response.json();
         historyData = data.history || [];
         
@@ -56,7 +79,7 @@ function renderHistory(history) {
         return;
     }
     
-    let html = '<table class="table is-fullwidth is-striped is-hoverable">';
+    let html = '<div class="table-container"><table class="table is-fullwidth is-striped is-hoverable is-narrow is-size-7" style="white-space: nowrap;">';
     html += '<thead><tr>';
     html += '<th>时间 / Time</th>';
     html += '<th>类型 / Type</th>';
@@ -130,7 +153,7 @@ function renderHistory(history) {
         html += '</tr>';
     });
     
-    html += '</tbody></table>';
+    html += '</tbody></table></div>';
     container.innerHTML = html;
 }
 

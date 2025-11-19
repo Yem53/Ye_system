@@ -52,6 +52,32 @@
     </div>
 </div>
 
+<!-- 收益概览 -->
+<div class="card" style="margin-bottom:1rem;" id="pnl-card">
+    <header class="card-header">
+        <p class="card-header-title">收益概览 / PnL Summary</p>
+        <span class="tag is-light">最近 <span id="pnl-days-label">--</span> 天</span>
+    </header>
+    <div class="card-content">
+        <div class="columns is-multiline">
+            <div class="column is-one-quarter">
+                <p class="heading">累计收益 / Total</p>
+                <p class="title is-4" id="pnl-total">--</p>
+            </div>
+            <div class="column is-one-quarter">
+                <p class="heading">今日收益 / Today</p>
+                <p class="title is-4" id="pnl-today">--</p>
+            </div>
+            <div class="column">
+                <p class="heading">最近每日收益 / Recent Daily PnL</p>
+                <div id="pnl-daily-list" class="pnl-daily-list has-text-grey">
+                    加载中...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="card" style="margin-bottom:1rem;">
     <header class="card-header">
         <p class="card-header-title">手动下单计划 / Manual Trading Plans</p>
@@ -180,13 +206,13 @@
     <div class="card-content">
         <div class="columns is-vcentered">
             <div class="column">
-                <p class="title is-5" style="color: white; margin-bottom: 0.5rem;">
+                <p class="title is-5" style="color: white; margin-bottom: 0.8rem;">
                     📊 交易历史记录 / Trading History
                 </p>
-                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9);">
+                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9); margin-bottom: 0.5rem; line-height: 1.4;">
                     查看所有买入、退出记录及退出条件，便于复盘和调整策略参数
                 </p>
-                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9);">
+                <p class="subtitle is-6" style="color: rgba(255,255,255,0.9); line-height: 1.4;">
                     View all buy/sell records and exit conditions for strategy review and parameter adjustment
                 </p>
             </div>
@@ -253,6 +279,9 @@ let refreshInterval;
 let currentRefreshRate = 1000; // 默认1秒刷新
 const HIGH_FREQ_RATE = 200; // 高频刷新：200毫秒（有持仓或临近交易时，仅HTTP fallback模式）
 const NORMAL_RATE = 1000; // 正常刷新：1秒（无持仓且无临近交易时，仅HTTP fallback模式）
+const PNL_SUMMARY_DAYS = 14;
+const PNL_REFRESH_INTERVAL = 60000; // 60秒刷新收益摘要
+let pnlRefreshTimer = null;
 
 // 混合模式的刷新频率配置
 const HTTP_REFRESH_RATE_WS_CONNECTED = 1000; // WebSocket连接时，HTTP轮询频率（1秒，只更新余额和手动计划）
@@ -273,6 +302,14 @@ function formatNumber(num, decimals = 3) {
 function formatPercent(num) {
     const sign = num >= 0 ? '+' : '';
     return sign + formatNumber(num, 2) + '%';
+}
+
+function formatCurrency(num, decimals = 2) {
+    if (isNaN(num)) {
+        return '--';
+    }
+    const sign = num >= 0 ? '+' : '';
+    return `${sign}${formatNumber(Math.abs(num), decimals)} USDT`;
 }
 
 // 更新账户信息
@@ -319,6 +356,64 @@ function updateAccountInfo(data) {
     
     document.getElementById('position-count').textContent = data.position_count || 0;
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString('zh-CN');
+}
+
+async function loadPnlSummary(days = PNL_SUMMARY_DAYS) {
+    try {
+        const response = await fetch(`/api/pnl/summary?days=${days}`, {
+            method: 'GET',
+            cache: 'no-cache'
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        updatePnlSummaryCard(data);
+    } catch (error) {
+        console.error('加载收益概要失败:', error);
+        const listEl = document.getElementById('pnl-daily-list');
+        if (listEl) {
+            listEl.classList.add('has-text-danger');
+            listEl.textContent = '加载失败，请稍后重试 / Load failed, please retry';
+        }
+    }
+}
+
+function updatePnlSummaryCard(data) {
+    if (!data) {
+        return;
+    }
+    const totalEl = document.getElementById('pnl-total');
+    const todayEl = document.getElementById('pnl-today');
+    const daysLabel = document.getElementById('pnl-days-label');
+    const listEl = document.getElementById('pnl-daily-list');
+    
+    if (totalEl && typeof data.total_pnl === 'number') {
+        totalEl.textContent = formatCurrency(data.total_pnl);
+        totalEl.className = data.total_pnl >= 0 ? 'has-text-success' : 'has-text-danger';
+    }
+    if (todayEl && typeof data.today_pnl === 'number') {
+        todayEl.textContent = formatCurrency(data.today_pnl);
+        todayEl.className = data.today_pnl >= 0 ? 'has-text-success' : 'has-text-danger';
+    }
+    if (daysLabel && typeof data.days === 'number') {
+        daysLabel.textContent = data.days;
+    }
+    
+    if (listEl) {
+        listEl.innerHTML = '';
+        if (data.daily && data.daily.length > 0) {
+            data.daily.slice(-10).forEach(item => {
+                const value = typeof item.pnl === 'number' ? item.pnl : 0;
+                const span = document.createElement('div');
+                span.innerHTML = `<span>${item.date}</span> <span class="${value >= 0 ? 'pnl-positive' : 'pnl-negative'}">${formatCurrency(value)}</span>`;
+                listEl.appendChild(span);
+            });
+            listEl.classList.remove('has-text-danger');
+        } else {
+            listEl.textContent = '暂无历史记录 / No data';
+        }
+    }
 }
 
 // 更新UTC时间显示
@@ -606,52 +701,122 @@ function _updatePositionsInternal(positions) {
     }
 }
 
+function renderHighLowText(pos) {
+    const hasHigh = pos.highest_price !== null && pos.highest_price !== undefined;
+    const hasLow = pos.lowest_price !== null && pos.lowest_price !== undefined;
+    
+    if (hasHigh && hasLow) {
+        if (pos.side === 'BUY') {
+            return `<span class="has-text-success">${formatNumber(pos.highest_price, 3)}</span> / ${formatNumber(pos.lowest_price, 3)}`;
+        }
+        return `${formatNumber(pos.highest_price, 3)} / <span class="has-text-danger">${formatNumber(pos.lowest_price, 3)}</span>`;
+    }
+    
+    if (hasHigh) {
+        return `<span class="has-text-success">${formatNumber(pos.highest_price, 3)}</span> / -`;
+    }
+    
+    if (hasLow) {
+        return `- / <span class="has-text-danger">${formatNumber(pos.lowest_price, 3)}</span>`;
+    }
+    
+    return '-';
+}
+
+function renderTrailingStopPriceText(pos) {
+    if (pos.trailing_stop_price === null || pos.trailing_stop_price === undefined) {
+        return '-';
+    }
+    return formatNumber(pos.trailing_stop_price, 3);
+}
+
+function renderTrailingDistanceInfo(pos) {
+    if (pos.trailing_stop_distance === null || pos.trailing_stop_distance === undefined) {
+        return { text: '-', className: '' };
+    }
+    
+    const distance = Number(pos.trailing_stop_distance);
+    if (Number.isNaN(distance)) {
+        return { text: '-', className: '' };
+    }
+    
+    if (distance < 0) {
+        return { text: `${formatNumber(Math.abs(distance), 3)} (已触发)`, className: 'has-text-danger' };
+    }
+    
+    if (distance === 0) {
+        return { text: formatNumber(distance, 3), className: '' };
+    }
+    
+    return { text: formatNumber(distance, 3), className: 'has-text-success' };
+}
+
+function renderStopTrailText(pos) {
+    const stopLossPct = ((pos.stop_loss_pct ?? 0) * 100).toFixed(2);
+    const trailingExitPct = ((pos.trailing_exit_pct ?? 0) * 100).toFixed(2);
+    return `${stopLossPct}% / ${trailingExitPct}%`;
+}
+
+function renderPrincipalText(pos) {
+    if (pos.principal !== null && pos.principal !== undefined) {
+        return `${formatNumber(pos.principal, 3)} USDT`;
+    }
+    
+    const priceValue = pos.entry_price ?? pos.entryPrice ?? null;
+    const quantityValue = pos.quantity ?? pos.entry_quantity ?? null;
+    
+    if (priceValue !== null && priceValue !== undefined &&
+        quantityValue !== null && quantityValue !== undefined) {
+        const principal = Number(priceValue) * Number(quantityValue);
+        if (!Number.isNaN(principal) && principal > 0) {
+            return `${formatNumber(principal, 3)} USDT`;
+        }
+    }
+    
+    return '-';
+}
+
 // 创建持仓表格
 function createPositionsTable(container, positions) {
     const fragment = document.createDocumentFragment();
-    const table = document.createElement('table');
-    table.className = 'table is-fullwidth is-striped is-hoverable';
+    const tableContainer = document.createElement('div');
+    tableContainer.className = 'table-container';
     
-    // 表头（两行显示）
+    const table = document.createElement('table');
+    table.className = 'table is-fullwidth is-striped is-hoverable is-narrow is-size-7';
+    table.style.whiteSpace = 'nowrap';
+    
     const thead = document.createElement('thead');
     thead.innerHTML = `
         <tr>
-            <th rowspan="2">交易对 / Symbol</th>
-            <th rowspan="2">方向 / Side</th>
-            <th rowspan="2">入场价 / Entry</th>
-            <th rowspan="2">当前价 / Current</th>
-            <th rowspan="2">数量 / Quantity</th>
-            <th rowspan="2">杠杆 / Leverage</th>
-            <th rowspan="2">盈亏% / P&L %</th>
-            <th rowspan="2">盈亏金额 / P&L Value</th>
-            <th rowspan="2">本金 / Principal</th>
-            <th colspan="4">滑动退出监控 / Trailing Stop Monitor</th>
-            <th rowspan="2">操作 / Actions</th>
-        </tr>
-        <tr>
+            <th>交易对 / Symbol</th>
+            <th>方向 / Side</th>
+            <th>入场价 / Entry</th>
+            <th>当前价 / Current</th>
+            <th>数量 / Quantity</th>
+            <th>杠杆 / Leverage</th>
+            <th>本金 / Principal</th>
+            <th>盈亏% / P&L %</th>
+            <th>盈亏金额 / P&L Value</th>
             <th>最高/最低 / High/Low</th>
             <th>触发价 / Trigger</th>
             <th>距离 / Distance</th>
             <th>止损/滑动% / Stop/Trail %</th>
+            <th>操作 / Actions</th>
         </tr>
     `;
     table.appendChild(thead);
     
-    // 表体
     const tbody = document.createElement('tbody');
     positions.forEach(pos => {
         const row = createPositionRow(pos);
         tbody.appendChild(row);
-        // 如果有第二行，也添加
-        if (row._detailRow) {
-            tbody.appendChild(row._detailRow);
-        }
     });
     table.appendChild(tbody);
     
-    fragment.appendChild(table);
+    tableContainer.appendChild(table);
+    fragment.appendChild(tableContainer);
     
-    // 直接替换，不使用淡入淡出（避免闪烁）
     container.innerHTML = '';
     container.appendChild(fragment);
     positionsTable = table;
@@ -659,250 +824,66 @@ function createPositionsTable(container, positions) {
     currentDisplayedPositionIds = new Set(positions.map(p => p.id));
 }
 
-// 创建持仓行（两行显示）
+// 创建持仓行（单行显示，保持紧凑）
 function createPositionRow(pos) {
     const row = document.createElement('tr');
     row.setAttribute('data-position-id', pos.id);
     
-    const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
+    const entryPriceText = pos.entry_price !== null && pos.entry_price !== undefined
+        ? formatNumber(pos.entry_price, 3)
+        : '-';
+    const currentPriceText = pos.current_price !== null && pos.current_price !== undefined
+        ? formatNumber(pos.current_price, 3)
+        : '-';
+    const quantityText = pos.quantity !== null && pos.quantity !== undefined
+        ? formatNumber(pos.quantity, 3)
+        : '-';
+    const leverageText = pos.leverage !== null && pos.leverage !== undefined
+        ? `${pos.leverage}x`
+        : '-';
+    const principalText = renderPrincipalText(pos);
     
-    const stopLossPct = (pos.stop_loss_pct || 0) * 100;
-    const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
-    const principal = pos.principal || 0;
+    const hasPnlPct = pos.pnl_pct !== null && pos.pnl_pct !== undefined;
+    const pnlValue = hasPnlPct ? Number(pos.pnl_pct) : 0;
+    const pnlClass = hasPnlPct ? (pnlValue >= 0 ? 'has-text-success' : 'has-text-danger') : '';
+    const pnlPctText = hasPnlPct ? formatPercent(pnlValue) : '-';
     
-    // 显示最高/最低价（用于滑动退出追踪）
-    let highLowText = '-';
-    if (pos.highest_price && pos.lowest_price) {
-        if (pos.side === 'BUY') {
-            highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price, 3)}</span> / ${formatNumber(pos.lowest_price, 3)}`;
-        } else {
-            highLowText = `${formatNumber(pos.highest_price, 3)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price, 3)}</span>`;
-        }
-    } else if (pos.highest_price) {
-        highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price, 3)}</span> / -`;
-    } else if (pos.lowest_price) {
-        highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price, 3)}</span>`;
-    }
+    const hasPnlAmount = pos.pnl_value !== null && pos.pnl_value !== undefined;
+    const pnlAmountText = hasPnlAmount ? `${formatNumber(pos.pnl_value, 3)} USDT` : '-';
     
-    // 显示滑动退出触发价和距离
-    let trailingStopText = '-';
-    let distanceText = '-';
-    let distanceClass = '';
-    if (pos.trailing_stop_price !== null && pos.trailing_stop_price !== undefined) {
-        trailingStopText = formatNumber(pos.trailing_stop_price, 3);
-        if (pos.trailing_stop_distance !== null && pos.trailing_stop_distance !== undefined) {
-            const distance = pos.trailing_stop_distance;
-            if (distance < 0) {
-                distanceText = `<span class="has-text-danger">${formatNumber(Math.abs(distance), 3)} (已触发)</span>`;
-                distanceClass = 'has-text-danger';
-            } else {
-                distanceText = `<span class="has-text-success">${formatNumber(distance, 3)}</span>`;
-                distanceClass = 'has-text-success';
-            }
-        }
-    }
-    
-    // 显示当前价与最高/最低价的对比
-    let priceComparisonText = '-';
-    if (pos.side === 'BUY' && pos.highest_price) {
-        const diffFromHigh = pos.current_price - pos.highest_price;
-        const diffPct = (diffFromHigh / pos.highest_price) * 100;
-        priceComparisonText = `<span class="${diffFromHigh >= 0 ? 'has-text-success' : 'has-text-danger'}" title="当前价相对最高价: ${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%">${formatNumber(pos.current_price, 3)} (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%)</span>`;
-    } else if (pos.side === 'SELL' && pos.lowest_price) {
-        const diffFromLow = pos.current_price - pos.lowest_price;
-        const diffPct = (diffFromLow / pos.lowest_price) * 100;
-        priceComparisonText = `<span class="${diffFromLow <= 0 ? 'has-text-success' : 'has-text-danger'}" title="当前价相对最低价: ${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%">${formatNumber(pos.current_price, 3)} (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(3)}%)</span>`;
-    }
+    const highLowText = renderHighLowText(pos);
+    const trailingStopPriceText = renderTrailingStopPriceText(pos);
+    const trailingDistanceInfo = renderTrailingDistanceInfo(pos);
+    const stopTrailText = renderStopTrailText(pos);
     
     row.innerHTML = `
-        <td rowspan="2"><strong>${pos.symbol}</strong></td>
-        <td rowspan="2"><span class="tag ${pos.side === 'BUY' ? 'is-success' : 'is-danger'}">${pos.side}</span></td>
-        <td rowspan="2" data-field="entry_price">${formatNumber(pos.entry_price, 3)}</td>
-        <td rowspan="2" data-field="current_price"><strong>${formatNumber(pos.current_price, 3)}</strong></td>
-        <td rowspan="2" data-field="quantity">${formatNumber(pos.quantity, 3)}</td>
-        <td rowspan="2" data-field="leverage">${pos.leverage}x</td>
-        <td rowspan="2" data-field="pnl_pct" class="${pnlClass}"><strong>${formatPercent(pos.pnl_pct)}</strong></td>
-        <td rowspan="2" data-field="pnl_value" class="${pnlClass}"><strong>${formatNumber(pos.pnl_value || 0, 3)} USDT</strong></td>
-        <td rowspan="2" data-field="principal"><strong>${formatNumber(principal, 3)} USDT</strong></td>
+        <td data-field="symbol"><strong>${pos.symbol}</strong></td>
+        <td data-field="side"><span class="tag ${pos.side === 'BUY' ? 'is-success' : 'is-danger'}">${pos.side}</span></td>
+        <td data-field="entry_price">${entryPriceText}</td>
+        <td data-field="current_price"><strong>${currentPriceText}</strong></td>
+        <td data-field="quantity">${quantityText}</td>
+        <td data-field="leverage">${leverageText}</td>
+        <td data-field="principal">${principalText}</td>
+        <td data-field="pnl_pct" class="${pnlClass}"><strong>${pnlPctText}</strong></td>
+        <td data-field="pnl_value" class="${pnlClass}"><strong>${pnlAmountText}</strong></td>
         <td data-field="high_low">${highLowText}</td>
-        <td data-field="trailing_stop_price">${trailingStopText}</td>
-        <td data-field="trailing_stop_distance" class="${distanceClass}">${distanceText}</td>
-        <td data-field="stop_trail_pct">${stopLossPct.toFixed(2)}% / ${trailingExitPct.toFixed(2)}%</td>
-        <td rowspan="2">
+        <td data-field="trailing_stop_price">${trailingStopPriceText}</td>
+        <td data-field="trailing_stop_distance" class="${trailingDistanceInfo.className || ''}">${trailingDistanceInfo.text}</td>
+        <td data-field="stop_trail_pct">${stopTrailText}</td>
+        <td data-field="actions">
             <button class="button is-small is-info" onclick="editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})">
                 编辑 / Edit
             </button>
         </td>
     `;
     
-    // 添加第二行（显示价格对比）
-    const row2 = document.createElement('tr');
-    row2.setAttribute('data-position-id', pos.id + '-detail');
-    row2.innerHTML = `
-        <td colspan="4" data-field="price_comparison" style="font-size: 0.9em; color: #666;">
-            <strong>价格对比 / Price Comparison:</strong> ${priceComparisonText}
-        </td>
-    `;
-    
-    // 返回第一行，第二行需要单独处理
-    // 注意：这里返回row，第二行会在外部添加
-    row._detailRow = row2;  // 将第二行附加到第一行上，方便后续处理
     return row;
 }
 
-// 更新持仓行（只更新变化的单元格）- 方案1+4：增强精度比较 + 使用textContent
-function updatePositionRow(row, pos, lastPos) {
-    if (!lastPos) {
-        // 如果没有上次数据，完全更新
-        const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
-        const stopLossPct = (pos.stop_loss_pct || 0) * 100;
-        const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
-        
-        // 显示最高/最低价（用于滑动退出追踪）
-        let highLowText = '-';
-        if (pos.highest_price && pos.lowest_price) {
-            if (pos.side === 'BUY') {
-                highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price)}</span> / ${formatNumber(pos.lowest_price)}`;
-            } else {
-                highLowText = `${formatNumber(pos.highest_price)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price)}</span>`;
-            }
-        } else if (pos.highest_price) {
-            highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price)}</span> / -`;
-        } else if (pos.lowest_price) {
-            highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price)}</span>`;
-        }
-        
-        row.innerHTML = `
-            <td><strong>${pos.symbol}</strong></td>
-            <td><span class="tag ${pos.side === 'BUY' ? 'is-success' : 'is-danger'}">${pos.side}</span></td>
-            <td data-field="entry_price">${formatNumber(pos.entry_price)}</td>
-            <td data-field="current_price"><strong>${formatNumber(pos.current_price)}</strong></td>
-            <td data-field="quantity">${formatNumber(pos.quantity)}</td>
-            <td data-field="leverage">${pos.leverage}x</td>
-            <td data-field="pnl_pct" class="${pnlClass}"><strong>${formatPercent(pos.pnl_pct)}</strong></td>
-            <td data-field="pnl_value" class="${pnlClass}"><strong>${formatNumber(pos.pnl_value || 0)} USDT</strong></td>
-            <td data-field="high_low">${highLowText}</td>
-            <td data-field="stop_loss_pct">${stopLossPct.toFixed(2)}%</td>
-            <td data-field="trailing_exit_pct">${trailingExitPct.toFixed(2)}%</td>
-            <td>
-                <button class="button is-small is-info" onclick="editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})">
-                    编辑 / Edit
-                </button>
-            </td>
-        `;
-        return;
-    }
-    
-    // 币安风格：精确比较（价格0.01，PnL 0.1%），但不过度过滤
-    const roundPrice = (p) => Math.round(p * 100) / 100;  // 0.01精度
-    const roundPnl = (p) => Math.round(p * 1000) / 1000;  // 0.1%精度（0.001）
-    const roundValue = (v) => Math.round(v * 100) / 100;   // 0.01精度
-    
-    // 当前价：只在真正变化时才更新（币安风格：精确比较）
-    const priceDiff = Math.abs(roundPrice(pos.current_price) - roundPrice(lastPos.current_price));
-    if (priceDiff >= 0.01) {  // 0.01或以上才更新
-        const cell = row.querySelector('[data-field="current_price"]');
-        if (cell) {
-            // 使用textContent替代innerHTML（减少重排，币安风格）
-            const strongTag = cell.querySelector('strong');
-            if (strongTag) {
-                strongTag.textContent = formatNumber(pos.current_price);
-            } else {
-                cell.textContent = formatNumber(pos.current_price);
-            }
-        }
-    }
-    
-    // 盈亏百分比：只在真正变化时才更新（币安风格：0.1%精度）
-    const pnlPctDiff = Math.abs(roundPnl(pos.pnl_pct) - roundPnl(lastPos.pnl_pct));
-    if (pnlPctDiff >= 0.001) {  // 0.1%或以上才更新
-        const cell = row.querySelector('[data-field="pnl_pct"]');
-        if (cell) {
-            const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
-            cell.className = pnlClass;
-            // 使用textContent替代innerHTML（币安风格）
-            const strongTag = cell.querySelector('strong');
-            if (strongTag) {
-                strongTag.textContent = formatPercent(pos.pnl_pct);
-            } else {
-                cell.textContent = formatPercent(pos.pnl_pct);
-            }
-        }
-    }
-    
-    // 盈亏金额：只在真正变化时才更新（币安风格：0.01精度）
-    const valueDiff = Math.abs(roundValue(pos.pnl_value || 0) - roundValue(lastPos.pnl_value || 0));
-    if (valueDiff >= 0.01) {  // 0.01 USDT或以上才更新
-        const cell = row.querySelector('[data-field="pnl_value"]');
-        if (cell) {
-            const pnlClass = pos.pnl_pct >= 0 ? 'has-text-success' : 'has-text-danger';
-            cell.className = pnlClass;
-            // 使用textContent替代innerHTML（币安风格）
-            const strongTag = cell.querySelector('strong');
-            if (strongTag) {
-                strongTag.textContent = formatNumber(pos.pnl_value || 0) + ' USDT';
-            } else {
-                cell.textContent = formatNumber(pos.pnl_value || 0) + ' USDT';
-            }
-        }
-    }
-    
-    // 更新最高/最低价（如果变化）
-    const highLowCell = row.querySelector('[data-field="high_low"]');
-    if (highLowCell) {
-        let highLowText = '-';
-        if (pos.highest_price && pos.lowest_price) {
-            if (pos.side === 'BUY') {
-                highLowText = `<span class="has-text-success" title="历史最高价（用于滑动退出）">${formatNumber(pos.highest_price)}</span> / ${formatNumber(pos.lowest_price)}`;
-            } else {
-                highLowText = `${formatNumber(pos.highest_price)} / <span class="has-text-danger" title="历史最低价（用于滑动退出）">${formatNumber(pos.lowest_price)}</span>`;
-            }
-        } else if (pos.highest_price) {
-            highLowText = `<span class="has-text-success">${formatNumber(pos.highest_price)}</span> / -`;
-        } else if (pos.lowest_price) {
-            highLowText = `- / <span class="has-text-danger">${formatNumber(pos.lowest_price)}</span>`;
-        }
-        const lastHighLowText = lastPos ? 
-            ((lastPos.highest_price && lastPos.lowest_price) ? 
-                `${formatNumber(lastPos.highest_price)}/${formatNumber(lastPos.lowest_price)}` : 
-                (lastPos.highest_price ? formatNumber(lastPos.highest_price) : (lastPos.lowest_price ? formatNumber(lastPos.lowest_price) : '-'))) : 
-            '';
-        const currentHighLowText = (pos.highest_price && pos.lowest_price) ? 
-            `${formatNumber(pos.highest_price)}/${formatNumber(pos.lowest_price)}` : 
-            (pos.highest_price ? formatNumber(pos.highest_price) : (pos.lowest_price ? formatNumber(pos.lowest_price) : '-'));
-        if (currentHighLowText !== lastHighLowText) {
-            highLowCell.innerHTML = highLowText;
-        }
-    }
-    
-    // 更新退出参数（如果变化）
-    const stopLossPct = (pos.stop_loss_pct || 0) * 100;
-    const trailingExitPct = (pos.trailing_exit_pct || 0) * 100;
-    const lastStopLossPct = (lastPos.stop_loss_pct || 0) * 100;
-    const lastTrailingExitPct = (lastPos.trailing_exit_pct || 0) * 100;
-    
-    if (Math.abs(stopLossPct - lastStopLossPct) > 0.01) {
-        const cell = row.querySelector('[data-field="stop_loss_pct"]');
-        if (cell) {
-            cell.textContent = stopLossPct.toFixed(2) + '%';
-        }
-    }
-    
-    if (Math.abs(trailingExitPct - lastTrailingExitPct) > 0.01) {
-        const cell = row.querySelector('[data-field="trailing_exit_pct"]');
-        if (cell) {
-            cell.textContent = trailingExitPct.toFixed(2) + '%';
-        }
-    }
-    
-    // 更新编辑按钮（确保使用最新的参数）
-    const actionCell = row.querySelector('td:last-child');
-    if (actionCell) {
-        const button = actionCell.querySelector('button');
-        if (button) {
-            button.setAttribute('onclick', `editExitParams('${pos.id}', '${pos.symbol}', ${pos.stop_loss_pct}, ${pos.trailing_exit_pct})`);
-        }
-    }
+// 更新持仓行：重新渲染单行，保持最新布局
+function updatePositionRow(row, pos) {
+    const newRow = createPositionRow(pos);
+    row.innerHTML = newRow.innerHTML;
 }
 
 // 连接WebSocket
@@ -1222,6 +1203,10 @@ document.addEventListener('DOMContentLoaded', function() {
     // 尝试连接WebSocket（实时推送持仓和PnL数据）
     connectWebSocket();
     
+    // 加载收益摘要并定期刷新
+    loadPnlSummary();
+    pnlRefreshTimer = setInterval(() => loadPnlSummary(), PNL_REFRESH_INTERVAL);
+    
     // 每1秒更新UTC时间（实时显示，包含秒）
     setInterval(updateUTCTime, 1000);
 });
@@ -1230,6 +1215,9 @@ document.addEventListener('DOMContentLoaded', function() {
 window.addEventListener('beforeunload', function() {
     if (refreshInterval) {
         clearInterval(refreshInterval);
+    }
+    if (pnlRefreshTimer) {
+        clearInterval(pnlRefreshTimer);
     }
     if (ws) {
         ws.close();

@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field("", env="BINANCE_API_SECRET")
     announcement_poll_interval: int = Field(90, description="轮询币安公告的时间间隔（秒）")
     approval_required: bool = Field(True, description="是否启用人工审核流程")
-    manual_plan_check_interval: float = Field(0.1, description="手动计划检查间隔（秒），默认0.1秒（100毫秒），抢时间策略建议0.05-0.1秒")
+    manual_plan_check_interval: float = Field(
+        0.3,
+        description="手动计划检查间隔（秒），默认0.3秒。值过低会在运行时被强制提升以避免调度器实例堆积。",
+    )
     manual_plan_precision_threshold: float = Field(60.0, description="精确执行模式触发阈值（秒），当计划执行时间在N秒内时启用精确模式，默认60秒（1分钟）")
     manual_plan_precision_mode: bool = Field(True, description="是否启用精确执行模式（毫秒级精度），抢时间策略建议启用")
     leverage: int = Field(5, env="LEVERAGE", description="默认合约杠杆倍数")
@@ -75,6 +78,11 @@ class Settings(BaseSettings):
     websocket_price_enabled: bool = Field(True, description="是否启用WebSocket价格订阅服务，启用后可大幅降低价格获取延迟")
     websocket_price_symbols: str | None = Field(None, env="WEBSOCKET_PRICE_SYMBOLS", description="WebSocket订阅的交易对列表（逗号分隔），如 'BTCUSDT,ETHUSDT'，如果为空则使用默认列表")
     websocket_subscribe_before_minutes: float = Field(5.0, description="在执行交易前多少分钟开始订阅WebSocket价格（默认5分钟）")
+    terminal_log_level: str = Field("INFO", env="TERMINAL_LOG_LEVEL", description="终端日志最低级别（INFO/DEBUG/WARNING等）")
+    terminal_key_events_only: bool = Field(True, env="TERMINAL_KEY_EVENTS_ONLY", description="是否只在终端输出关键事件（仍会显示WARNING及以上）")
+    file_log_level: str = Field("DEBUG", env="FILE_LOG_LEVEL", description="写入日志文件的最低级别")
+    file_log_rotation: str = Field("1 day", env="FILE_LOG_ROTATION", description="日志文件轮转策略，例如 '1 day' 或 '100 MB'")
+    file_log_retention: str = Field("7 days", env="FILE_LOG_RETENTION", description="日志文件的保留时间或数量，例如 '7 days' 或 '10 files'")
 
     alpha_feed_url: HttpUrl | str = Field(
         "https://www.binance.com/bapi/apex/v1/public/apex/announcement/getLatestList",

@@ -50,6 +50,49 @@ class BinanceFuturesClient:
         if proxies:
             self.client.session.proxies.update(proxies)
 
+    def get_klines(self, symbol: str, interval: str = "1m", limit: int = 500, start_time: int | None = None, end_time: int | None = None) -> list[list]:
+        """获取K线数据（用于恢复中断期间的历史最高/最低价）
+        
+        Args:
+            symbol: 交易对符号
+            interval: K线间隔（1m, 5m, 15m, 1h, 1d等）
+            limit: 返回的K线数量（最多1000）
+            start_time: 开始时间戳（毫秒）
+            end_time: 结束时间戳（毫秒）
+        
+        Returns:
+            K线数据列表，每个元素格式：[开盘时间, 开盘价, 最高价, 最低价, 收盘价, 成交量, ...]
+        """
+        symbol = symbol.upper()
+        try:
+            import requests
+            
+            url = "https://fapi.binance.com/fapi/v1/klines"
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": min(limit, 1000),  # 币安API最多返回1000条
+            }
+            
+            if start_time:
+                params["startTime"] = start_time
+            if end_time:
+                params["endTime"] = end_time
+            
+            proxies = None
+            if self.settings.http_proxy or self.settings.https_proxy:
+                proxies = {
+                    "http": self.settings.http_proxy or self.settings.https_proxy,
+                    "https": self.settings.https_proxy or self.settings.http_proxy,
+                }
+            
+            response = requests.get(url, params=params, proxies=proxies, timeout=self.settings.binance_http_timeout)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            logger.warning("获取K线数据失败 ({}): {}", symbol, exc)
+            return []
+
     def get_symbol_info(self, symbol: str) -> dict:
         """获取交易对信息（包括 stepSize 等精度参数），带缓存"""
         symbol = symbol.upper()
@@ -684,7 +727,14 @@ class BinanceFuturesClient:
         """获取合约账户余额（保持向后兼容）"""
         return self.get_futures_balance()
 
-    def place_market_order(self, symbol: str, side: str, quantity: Decimal, reduce_only: bool = False) -> dict:
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        reduce_only: bool = False,
+        position_side: str | None = None,
+    ) -> dict:
         """
         下市价单（直接使用 requests，避免 python-binance 库的 URL 拼接问题）
         
@@ -746,24 +796,27 @@ class BinanceFuturesClient:
                 "recvWindow": 10000,  # 增加到10秒的时间窗口，避免时间戳过期
             }
             
-            # 如果是双向持仓模式，需要指定 positionSide
+            # 如果是双向持仓模式，需要指定 positionSide（使用调用方提供的真实方向）
             if position_mode == "HEDGE_MODE":
-                # BUY 对应 LONG，SELL 对应 SHORT
-                params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+                if position_side:
+                    params["positionSide"] = position_side.upper()
+                else:
+                    # 回退逻辑：按下单方向推断（保持向后兼容）
+                    params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
                 
-                # 在双向持仓模式下，如果是平仓操作，添加 reduceOnly 参数（避免需要额外保证金）
-                # 注意：单向持仓模式（ONE_WAY_MODE）不支持 reduceOnly 参数，会报错
-                if reduce_only:
-                    params["reduceOnly"] = "true"
-                    logger.info("平仓订单（双向持仓模式）: symbol=%s, side=%s, quantity=%s, reduceOnly=true", symbol, side, quantity_str)
-            else:
-                # 单向持仓模式下，币安会自动识别平仓操作（通过反向操作），不需要 reduceOnly 参数
-                # 明确不添加 reduceOnly 参数，避免错误
-                if reduce_only:
-                    logger.info("平仓订单（单向持仓模式）: symbol=%s, side=%s, quantity=%s (单向模式，不添加reduceOnly参数)", symbol, side, quantity_str)
-                # 确保在单向模式下不添加 reduceOnly
+                # 在双向持仓模式下，平仓通过 positionSide 和反向 side 确定，不需要 reduceOnly
+                # 官方文档并未强制要求 reduceOnly，且部分情况下会报错 code: -1106
                 if "reduceOnly" in params:
                     del params["reduceOnly"]
+            else:
+                # 单向持仓模式下，如果是平仓操作，必须添加 reduceOnly 参数
+                # 这样可以确保只减仓不加仓
+                if reduce_only:
+                    params["reduceOnly"] = "true"
+                    logger.info("平仓订单（单向持仓模式）: symbol=%s, side=%s, quantity=%s, reduceOnly=true", symbol, side, quantity_str)
+                else:
+                    if "reduceOnly" in params:
+                        del params["reduceOnly"]
             
             # 生成签名（在构建完所有参数后）
             query_string = urlencode(params, doseq=True)

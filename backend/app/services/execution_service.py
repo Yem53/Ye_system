@@ -9,6 +9,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
+from app.core.logging_config import log_key_event
 from app.models.enums import PositionStatus, TradePlanStatus
 from app.models.execution_log import ExecutionLog
 from app.models.manual_plan import ManualPlan
@@ -42,7 +43,7 @@ class ExecutionService:
         if self.settings.max_order_amount:
             max_amount = Decimal(str(self.settings.max_order_amount))
             if allocation > max_amount:
-                logger.info("购买金额 %s 超过最大限制 %s，已限制为最大金额", allocation, max_amount)
+                log_key_event("INFO", "购买金额 %s 超过最大限制 %s，已限制为最大金额", allocation, max_amount)
                 allocation = max_amount
         
         # 使用传入的杠杆，如果没有则使用系统默认杠杆
@@ -81,11 +82,11 @@ class ExecutionService:
         
         if order_type == "LIMIT":
             # 限价单：使用预期价格下单
-            logger.info("使用限价单下单 {} {} @ {}", symbol, side, expected_price)
+            log_key_event("INFO", "使用限价单下单 {} {} @ {}", symbol, side, expected_price)
             order_result = self.client.place_limit_order(symbol, side, quantity, expected_price)
         else:  # MARKET
             # 市价单：直接下单
-            logger.info("使用市价单下单 {} {}", symbol, side)
+            log_key_event("INFO", "使用市价单下单 {} {}", symbol, side)
             order_result = self.client.place_market_order(symbol, side, quantity)
             
             # 对于市价单，如果状态是 NEW，等待一下然后查询订单状态
@@ -93,7 +94,7 @@ class ExecutionService:
             if order_status == "NEW":
                 order_id = str(order_result.get("orderId", ""))
                 if order_id:
-                    logger.info("市价单已提交，等待成交，订单ID: {}", order_id)
+                    log_key_event("INFO", "市价单已提交，等待成交，订单ID: {}", order_id)
                     # 等待最多3秒，每0.5秒检查一次
                     import time
                     for _ in range(6):
@@ -102,7 +103,7 @@ class ExecutionService:
                             order_result = self.client.get_order_status(symbol, order_id)
                             order_status = order_result.get("status", "").upper()
                             if order_status in ["FILLED", "PARTIALLY_FILLED"]:
-                                logger.info("市价单已成交，订单ID: {}", order_id)
+                                log_key_event("INFO", "市价单已成交，订单ID: {}", order_id)
                                 break
                         except Exception as exc:
                             logger.debug("查询订单状态失败: {}", exc)
@@ -148,7 +149,7 @@ class ExecutionService:
             # 先检查初始订单状态
             initial_status = order_result.get("status", "").upper()
             if initial_status == "FILLED":
-                logger.info("限价单立即成交: {}", order_id)
+                log_key_event("INFO", "限价单立即成交: {}", order_id)
                 return order_result
             elif initial_status in ["CANCELED", "REJECTED", "EXPIRED"]:
                 logger.warning("限价单被拒绝/取消/过期: {}, 状态: {}", order_id, initial_status)
@@ -162,7 +163,7 @@ class ExecutionService:
                     status = order_status.get("status", "").upper()
                     
                     if status == "FILLED":
-                        logger.info("限价单已成交: {}", order_id)
+                        log_key_event("INFO", "限价单已成交: {}", order_id)
                         return order_status
                     elif status == "PARTIALLY_FILLED":
                         # 部分成交，继续等待
@@ -181,12 +182,12 @@ class ExecutionService:
             # 超时或取消，转为市价单
             try:
                 self.client.cancel_order(symbol, order_id)
-                logger.info("限价单超时，已取消并转为市价单")
+                log_key_event("INFO", "限价单超时，已取消并转为市价单")
             except Exception as exc:
                 logger.warning("取消限价单失败: {}", exc)
             
             # 转为市价单
-            logger.info("限价单未成交，转为市价单")
+            log_key_event("INFO", "限价单未成交，转为市价单")
             return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
         else:
             return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
@@ -279,7 +280,7 @@ class ExecutionService:
         plan.status = TradePlanStatus.ACTIVE
         plan.actual_entry_time = datetime.now(timezone.utc)
         self.db.commit()
-        logger.info("计划 %s 执行完成，订单ID: %s，持仓ID: %s", plan.id, order_id, position.id)
+        log_key_event("INFO", "计划 %s 执行完成，订单ID: %s，持仓ID: %s", plan.id, order_id, position.id)
 
     def execute_manual_plan(self, plan: ManualPlan) -> None:
         # 确保symbol格式正确，如果没有USDT后缀则自动添加
@@ -309,7 +310,7 @@ class ExecutionService:
         mark_price = self.client.get_mark_price(symbol) or Decimal("1")
         
         # 记录余额和价格信息
-        logger.info("执行计划 {}: 可用保证金={} USDT, 标记价格={}, 杠杆={}x, 仓位比例={}", 
+        log_key_event("INFO", "执行计划 {}: 可用保证金={} USDT, 标记价格={}, 杠杆={}x, 仓位比例={}", 
                    plan.id, balance, mark_price, plan.leverage, plan.position_pct)
         
         # 使用计划中的仓位比例，而不是设置中的默认值
@@ -327,7 +328,7 @@ class ExecutionService:
             # 需要的保证金 = 订单价值 / 杠杆 = allocation（应该等于 balance * position_pct）
             required_margin = order_value / Decimal(str(plan.leverage))
             
-            logger.info("计划 {}: 计算数量={}, 订单价值={} USDT, 需要保证金={} USDT, 可用保证金={} USDT", 
+            log_key_event("INFO", "计划 {}: 计算数量={}, 订单价值={} USDT, 需要保证金={} USDT, 可用保证金={} USDT", 
                        plan.id, quantity, order_value, required_margin, balance)
             
             # 检查保证金是否足够（留一点余量，避免精度问题）
@@ -368,7 +369,9 @@ class ExecutionService:
         if actual_quantity <= 0:
             raise ValueError(f"订单成交数量无效: {actual_quantity}, 订单ID: {order_id}")
         
-        # 创建持仓记录
+        # 创建持仓记录，使用手动计划中的参数
+        log_key_event("INFO", "创建持仓记录: 杠杆=%sx, 止损=%s%%, 滑动退出=%s%% (来自手动计划 %s)", 
+                     plan.leverage, float(plan.stop_loss_pct) * 100, float(plan.trailing_exit_pct) * 100, plan.id)
         position = Position(
             manual_plan_id=plan.id,
             symbol=symbol,
@@ -389,6 +392,7 @@ class ExecutionService:
         
         # 记录执行日志
         log = ExecutionLog(
+            trade_plan_id=None,  # 手动计划没有 trade_plan
             manual_plan_id=plan.id,
             position_id=position.id,
             event_type="order_filled",
@@ -403,4 +407,6 @@ class ExecutionService:
         self.db.add(log)
         
         self.db.commit()
-        logger.info("手动计划 %s 执行完成，订单ID: %s，持仓ID: %s", plan.id, order_id, position.id)
+        log_key_event("INFO", "手动计划 %s 执行完成，订单ID: %s，持仓ID: %s，杠杆=%sx，止损=%s%%，滑动退出=%s%%", 
+                     plan.id, order_id, position.id, plan.leverage, 
+                     float(plan.stop_loss_pct) * 100, float(plan.trailing_exit_pct) * 100)

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
-from app.models.enums import PositionStatus
+from app.core.logging_config import log_key_event
+from app.models.enums import PositionStatus, ManualPlanStatus
+from app.models.manual_plan import ManualPlan
 from app.models.position import Position
 from app.services.binance_service import BinanceFuturesClient
 from app.services.execution_service import ExecutionService
@@ -24,6 +29,33 @@ class PositionService:
         self.settings = settings or get_settings()
         self.client = BinanceFuturesClient(self.settings)
         self.executor = ExecutionService(db, settings)
+
+    def _finalize_manual_plan_if_needed(self, manual_plan_id: str | None, closed_position_id: str | None = None) -> None:
+        if not manual_plan_id:
+            return
+        plan = self.db.get(ManualPlan, manual_plan_id)
+        if not plan:
+            return
+        if plan.status in {
+            ManualPlanStatus.CANCELLED,
+            ManualPlanStatus.FAILED,
+            ManualPlanStatus.EXECUTED,
+        }:
+            return
+        stmt = (
+            select(Position.id)
+            .where(Position.status == PositionStatus.ACTIVE)
+            .where(Position.manual_plan_id == manual_plan_id)
+            .limit(1)
+        )
+        if closed_position_id:
+            stmt = stmt.where(Position.id != closed_position_id)
+        has_other_active = self.db.scalar(stmt)
+        if has_other_active:
+            return
+        plan.status = ManualPlanStatus.EXECUTED
+        plan.updated_at = datetime.now(timezone.utc)
+        logger.info("手动计划 %s 已全部执行完成，状态更新为 EXECUTED", plan.id)
 
     def monitor_positions(self, sync_from_binance: bool = True) -> None:
         """
@@ -39,35 +71,278 @@ class PositionService:
             except Exception as exc:
                 logger.warning("同步币安持仓时出错（继续监控）: {}", exc)
         
-        # 监控所有活跃持仓
+        # 快速查询活跃持仓（只查询必要字段，提高性能）
         stmt = select(Position).where(Position.status == PositionStatus.ACTIVE)
         positions = list(self.db.scalars(stmt))
         
         if not positions:
             return
         
-        logger.debug("监控 %s 个活跃持仓", len(positions))
+        # 批量获取所有持仓的价格（一次API调用，大幅提升性能）
+        symbols = list(set(pos.symbol for pos in positions))
+        prices = {}
+        try:
+            # 优先使用批量获取价格（如果支持）
+            if hasattr(self.client, 'get_mark_prices_batch'):
+                prices = self.client.get_mark_prices_batch(symbols)
+            else:
+                # 降级：逐个获取（但尽量减少调用）
+                for symbol in symbols:
+                    try:
+                        price = self.client.get_mark_price(symbol)
+                        if price:
+                            prices[symbol] = price
+                    except Exception:
+                        pass  # 单个价格获取失败不影响其他
+        except Exception as exc:
+            logger.debug("批量获取价格失败: {}", exc)
+            prices = {}
         
-        for position in positions:
+        # 并行处理持仓（充分利用多核CPU）
+        CPU_COUNT = os.cpu_count() or 4
+        PARALLEL_THRESHOLD = 2  # 持仓数>=2时使用并行处理
+        
+        positions_to_update = []  # 需要更新最高/最低价的持仓
+        positions_to_close = []  # 需要关闭的持仓
+        
+        if len(positions) >= PARALLEL_THRESHOLD:
+            # 多个持仓时并行处理（充分利用CPU资源）
+            max_workers = min(len(positions), CPU_COUNT, 8)  # 最多8个并发，避免过多线程
+            
+            def _check_single_position(pos_data: tuple) -> tuple:
+                """检查单个持仓（用于并行处理）"""
+                position, current_price = pos_data
+                try:
+                    current_price_decimal = Decimal(str(current_price))
+                    should_exit, exit_reason = self._should_exit_position(position, current_price_decimal)
+                    
+                    if should_exit:
+                        return ("close", position, current_price_decimal, exit_reason, None)
+                    elif self._should_update_high_low(position, current_price_decimal):
+                        return ("update", position, current_price_decimal, None, None)
+                    else:
+                        return ("none", position, None, None, None)
+                except Exception as exc:
+                    logger.error("并行检查持仓 %s 时出错: %s", position.id, exc, exc_info=True)
+                    return ("error", position, None, None, exc)
+            
+            # 准备数据
+            position_data = []
+            for position in positions:
+                current_price = prices.get(position.symbol)
+                if not current_price:
+                    # 如果批量获取失败，尝试单独获取
+                    try:
+                        current_price = self.client.get_mark_price(position.symbol)
+                    except Exception:
+                        logger.debug("无法获取 %s 的标记价格", position.symbol)
+                        continue
+                
+                if current_price:
+                    position_data.append((position, current_price))
+            
+            # 并行处理
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_check_single_position, data): data[0] 
+                          for data in position_data}
+                
+                for future in as_completed(futures):
+                    position = futures[future]
+                    try:
+                        action, pos, price, reason, error = future.result()
+                        if action == "close":
+                            positions_to_close.append((pos, price, reason))
+                        elif action == "update":
+                            positions_to_update.append((pos, price))
+                        elif action == "error":
+                            logger.error("持仓 %s 检查失败", position.id)
+                    except Exception as exc:
+                        logger.error("获取持仓 %s 检查结果失败: %s", position.id, exc)
+        else:
+            # 单个持仓时串行处理（避免线程开销）
+            for position in positions:
+                try:
+                    current_price = prices.get(position.symbol)
+                    if not current_price:
+                        try:
+                            current_price = self.client.get_mark_price(position.symbol)
+                        except Exception:
+                            logger.debug("无法获取 %s 的标记价格", position.symbol)
+                            continue
+                    
+                    current_price_decimal = Decimal(str(current_price))
+                    should_exit, exit_reason = self._should_exit_position(position, current_price_decimal)
+                    
+                    if should_exit:
+                        positions_to_close.append((position, current_price_decimal, exit_reason))
+                    elif self._should_update_high_low(position, current_price_decimal):
+                        positions_to_update.append((position, current_price_decimal))
+                except Exception as exc:
+                    logger.error("监控持仓 %s 时出错: %s", position.id, exc, exc_info=True)
+        
+        # 执行关闭操作（串行执行，避免并发问题）
+        for position, current_price, exit_reason in positions_to_close:
             try:
-                logger.debug("开始检查持仓 %s (%s %s), 入场价: %s, 止损百分比: %s%%, 滑动退出百分比: %s%%", 
-                           position.id, position.symbol, position.side, 
-                           position.entry_price, 
-                           float(position.stop_loss_pct) * 100,
-                           float(position.trailing_exit_pct) * 100)
-                self._check_position(position)
+                self._close_position(position, current_price, exit_reason)
             except Exception as exc:
-                logger.error("监控持仓 %s 时出错: %s", position.id, exc, exc_info=True)
-
-    def _check_position(self, position: Position) -> None:
-        """检查单个持仓，执行退出策略"""
-        # 获取当前价格
-        current_price = self.client.get_mark_price(position.symbol)
-        if not current_price:
-            logger.warning("无法获取 %s 的标记价格", position.symbol)
-            return
+                logger.error("关闭持仓 %s 失败: %s", position.id, exc, exc_info=True)
         
-        current_price = Decimal(str(current_price))
+        # 批量更新最高/最低价（优化：使用SQL批量更新减少数据库往返）
+        if positions_to_update:
+            try:
+                now = datetime.now(timezone.utc)
+                INTERRUPT_THRESHOLD = 300  # 5分钟
+                
+                # 分离需要中断恢复的持仓和正常更新的持仓
+                normal_updates = {}  # {position_id: (position, current_price, new_high, new_low)}
+                interrupt_recovery_needed = []  # [(position, current_price)]
+                
+                for position, current_price in positions_to_update:
+                    # 检测系统中断
+                    last_check = position.last_check_time or position.entry_time or now
+                    time_since_last_check = (now - last_check).total_seconds()
+                    is_likely_interrupted = time_since_last_check > INTERRUPT_THRESHOLD
+                    
+                    # 需要中断恢复的持仓单独处理（需要查询K线数据）
+                    if is_likely_interrupted and (position.highest_price is None or position.lowest_price is None):
+                        interrupt_recovery_needed.append((position, current_price))
+                    else:
+                        # 正常更新：计算新的最高/最低价
+                        new_high = max(position.highest_price or position.entry_price, current_price)
+                        new_low = min(position.lowest_price or position.entry_price, current_price)
+                        normal_updates[position.id] = (position, current_price, new_high, new_low)
+                
+                # 处理中断恢复（需要逐个处理，因为需要查询K线）
+                for position, current_price in interrupt_recovery_needed:
+                    try:
+                        # 计算需要查询的时间范围
+                        start_time = position.entry_time or position.last_check_time or (now - timedelta(hours=8))
+                        start_time_ms = int(start_time.timestamp() * 1000)
+                        end_time_ms = int(now.timestamp() * 1000)
+                        
+                        # 获取1分钟K线数据
+                        klines = self.client.get_klines(
+                            symbol=position.symbol,
+                            interval="1m",
+                            limit=500,
+                            start_time=start_time_ms,
+                            end_time=end_time_ms
+                        )
+                        
+                        if klines:
+                            kline_highs = [Decimal(str(k[2])) for k in klines]
+                            kline_lows = [Decimal(str(k[3])) for k in klines]
+                            
+                            recovered_high = max(kline_highs) if kline_highs else None
+                            recovered_low = min(kline_lows) if kline_lows else None
+                            
+                            # 使用恢复的数据更新最高/最低价
+                            if recovered_high and (position.highest_price is None or recovered_high > position.highest_price):
+                                position.highest_price = max(recovered_high, current_price)
+                                logger.info("监控时恢复持仓 %s (%s) 历史最高价: %s (从K线数据)", 
+                                          position.id, position.symbol, position.highest_price)
+                            if recovered_low and (position.lowest_price is None or recovered_low < position.lowest_price):
+                                position.lowest_price = min(recovered_low, current_price)
+                                logger.info("监控时恢复持仓 %s (%s) 历史最低价: %s (从K线数据)", 
+                                          position.id, position.symbol, position.lowest_price)
+                    except Exception as exc:
+                        logger.debug("监控时从K线数据恢复历史价格失败: {}", exc)
+                        # 如果恢复失败，采用保守策略：使用入场价初始化
+                        if position.highest_price is None:
+                            position.highest_price = position.entry_price
+                        if position.lowest_price is None:
+                            position.lowest_price = position.entry_price
+                    
+                    # 中断恢复后，也需要正常更新
+                    new_high = max(position.highest_price or position.entry_price, current_price)
+                    new_low = min(position.lowest_price or position.entry_price, current_price)
+                    normal_updates[position.id] = (position, current_price, new_high, new_low)
+                
+                # SQL批量更新（大幅减少数据库往返）
+                if normal_updates:
+                    # 使用SQLAlchemy的bulk_update_mappings进行批量更新
+                    update_mappings = []
+                    for pos_id, (position, current_price, new_high, new_low) in normal_updates.items():
+                        update_mappings.append({
+                            'id': pos_id,
+                            'highest_price': new_high,
+                            'lowest_price': new_low,
+                            'last_check_time': now
+                        })
+                    
+                    # 批量更新
+                    self.db.bulk_update_mappings(Position, update_mappings)
+                    self.db.commit()
+                    
+                    logger.debug("批量更新了 {} 个持仓的最高/最低价", len(update_mappings))
+            except Exception as exc:
+                logger.error("批量更新持仓最高/最低价失败: {}", exc, exc_info=True)
+                self.db.rollback()
+    
+    def _should_exit_position(self, position: Position, current_price: Decimal) -> tuple[bool, str]:
+        """快速检查持仓是否需要退出（不执行退出，只返回结果）
+        
+        Args:
+            position: 持仓对象
+            current_price: 当前价格
+        
+        Returns:
+            (should_exit, exit_reason): (是否需要退出, 退出原因)
+        """
+        # 检查止损
+        if position.side == "BUY":
+            stop_loss_price = position.entry_price * (Decimal("1") - Decimal(str(position.stop_loss_pct)))
+            if current_price <= stop_loss_price:
+                return True, "stop_loss"
+        else:
+            stop_loss_price = position.entry_price * (Decimal("1") + Decimal(str(position.stop_loss_pct)))
+            if current_price >= stop_loss_price:
+                return True, "stop_loss"
+        
+        # 检查滑动退出（使用保守的默认值策略）
+        # 改进1：如果 highest_price 为 None，使用 entry_price 而不是 current_price（更保守）
+        # 这样可以避免从当前价格开始计算，保持保守策略
+        if position.side == "BUY":
+            # 做多：使用历史最高价，如果没有则使用入场价（保守策略）
+            highest = position.highest_price if position.highest_price is not None else position.entry_price
+            if highest:
+                trailing_stop_price = highest * (Decimal("1") - Decimal(str(position.trailing_exit_pct)))
+                if current_price <= trailing_stop_price:
+                    return True, "trailing_stop"
+        else:
+            # 做空：使用历史最低价，如果没有则使用入场价（保守策略）
+            lowest = position.lowest_price if position.lowest_price is not None else position.entry_price
+            if lowest:
+                trailing_stop_price = lowest * (Decimal("1") + Decimal(str(position.trailing_exit_pct)))
+                if current_price >= trailing_stop_price:
+                    return True, "trailing_stop"
+        
+        return False, ""
+    
+    def _should_update_high_low(self, position: Position, current_price: Decimal) -> bool:
+        """检查是否需要更新最高/最低价"""
+        if position.highest_price is None or current_price > position.highest_price:
+            return True
+        if position.lowest_price is None or current_price < position.lowest_price:
+            return True
+        return False
+
+    def _check_position(self, position: Position, current_price: Decimal | None = None) -> None:
+        """检查单个持仓，执行退出策略
+        
+        Args:
+            position: 持仓对象
+            current_price: 当前价格（可选，如果提供则跳过API调用，提高性能）
+        """
+        # 获取当前价格（如果未提供）
+        if current_price is None:
+            price_result = self.client.get_mark_price(position.symbol)
+            if not price_result:
+                logger.warning("无法获取 %s 的标记价格", position.symbol)
+                return
+            current_price = Decimal(str(price_result))
+        else:
+            current_price = Decimal(str(current_price))
         now = datetime.now(timezone.utc)
         
         # 重要：在更新最高价/最低价之前，先保存用于滑动退出计算的基准价格
@@ -110,7 +385,7 @@ class PositionService:
             # 做多：价格下跌触发止损
             stop_loss_price = position.entry_price * (Decimal("1") - Decimal(str(position.stop_loss_pct)))
             if current_price <= stop_loss_price:
-                logger.info("持仓 %s (%s) 触发止损: 当前价 %s <= 止损价 %s (止损百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
+                log_key_event("INFO", "持仓 %s (%s) 触发止损: 当前价 %s <= 止损价 %s (止损百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
                           position.id, position.symbol, current_price, stop_loss_price, 
                           float(position.stop_loss_pct) * 100, pnl_pct, pnl_value)
                 self._close_position(position, current_price, "stop_loss")
@@ -124,7 +399,7 @@ class PositionService:
             # 做空：价格上涨触发止损
             stop_loss_price = position.entry_price * (Decimal("1") + Decimal(str(position.stop_loss_pct)))
             if current_price >= stop_loss_price:
-                logger.info("持仓 %s (%s) 触发止损: 当前价 %s >= 止损价 %s (止损百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
+                log_key_event("INFO", "持仓 %s (%s) 触发止损: 当前价 %s >= 止损价 %s (止损百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
                           position.id, position.symbol, current_price, stop_loss_price,
                           float(position.stop_loss_pct) * 100, pnl_pct, pnl_value)
                 self._close_position(position, current_price, "stop_loss")
@@ -142,7 +417,7 @@ class PositionService:
             trailing_stop_price = highest_for_trailing * (Decimal("1") - Decimal(str(position.trailing_exit_pct)))
             # 重要：只有当当前价格严格小于等于滑动止损价时才触发（避免浮点数精度问题）
             if current_price <= trailing_stop_price:
-                logger.info("持仓 %s (%s) 触发滑动退出: 当前价 %s <= 滑动止损价 %s (历史最高价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
+                log_key_event("INFO", "持仓 %s (%s) 触发滑动退出: 当前价 %s <= 滑动止损价 %s (历史最高价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
                           position.id, position.symbol, current_price, trailing_stop_price, highest_for_trailing,
                           float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
                 try:
@@ -166,7 +441,7 @@ class PositionService:
             trailing_stop_price = lowest_for_trailing * (Decimal("1") + Decimal(str(position.trailing_exit_pct)))
             # 重要：只有当当前价格严格大于等于滑动止损价时才触发（避免浮点数精度问题）
             if current_price >= trailing_stop_price:
-                logger.info("持仓 %s (%s) 触发滑动退出: 当前价 %s >= 滑动止损价 %s (历史最低价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
+                log_key_event("INFO", "持仓 %s (%s) 触发滑动退出: 当前价 %s >= 滑动止损价 %s (历史最低价: %s, 滑动退出百分比: %s%%, 当前盈亏: %.2f%%, %.2f USDT)", 
                           position.id, position.symbol, current_price, trailing_stop_price, lowest_for_trailing,
                           float(position.trailing_exit_pct) * 100, pnl_pct, pnl_value)
                 try:
@@ -208,17 +483,47 @@ class PositionService:
             except Exception as exc:
                 logger.warning("获取币安实际持仓数量失败: %s，使用数据库数量", exc)
             
-            # 如果币安上已经没有这个持仓了（可能已被手动平仓），直接标记为已关闭
+            # 如果币安上已经没有这个持仓了，需要判断是系统刚关闭还是外部关闭
             if not position_found_on_binance:
-                logger.warning("币安上已无持仓 %s %s，可能已被手动平仓，直接标记为已关闭", 
+                # 检查是否有最近的系统关闭记录（5分钟内）
+                try:
+                    from app.models.execution_log import ExecutionLog
+                    recent_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+                    recent_close_log = self.db.scalar(
+                        select(ExecutionLog)
+                        .where(ExecutionLog.position_id == position.id)
+                        .where(ExecutionLog.event_type == "position_closed")
+                        .where(ExecutionLog.created_at >= recent_time)
+                        .order_by(ExecutionLog.created_at.desc())
+                        .limit(1)
+                    )
+                    if recent_close_log:
+                        # 有系统关闭记录，说明是系统刚关闭的，使用系统设置的退出原因
+                        payload = recent_close_log.payload or {}
+                        system_reason = payload.get("reason", reason)
+                        logger.info("币安上已无持仓 %s %s，但检测到系统关闭记录（原因: %s），使用系统退出原因", 
+                                  position.symbol, position.side, system_reason)
+                        position.status = PositionStatus.CLOSED
+                        position.exit_price = exit_price if exit_price else (Decimal(str(recent_close_log.price)) if recent_close_log.price else position.entry_price)
+                        position.exit_quantity = Decimal("0")  # 已无持仓，数量为0
+                        position.exit_time = recent_close_log.created_at if recent_close_log.created_at else datetime.now(timezone.utc)
+                        position.exit_reason = system_reason  # 使用系统设置的退出原因
+                        self.db.commit()
+                        log_key_event("INFO", "持仓 %s 已标记为已关闭（系统关闭，原因: %s）", position.id, system_reason)
+                        return
+                except Exception as exc:
+                    logger.debug("检查系统关闭记录失败: %s，继续处理", exc)
+                
+                # 没有系统关闭记录，可能是外部手动平仓
+                logger.warning("币安上已无持仓 %s %s，且无系统关闭记录，可能已被手动平仓，标记为外部关闭", 
                              position.symbol, position.side)
                 position.status = PositionStatus.CLOSED
                 position.exit_price = exit_price
                 position.exit_quantity = Decimal("0")  # 已无持仓，数量为0
                 position.exit_time = datetime.now(timezone.utc)
-                position.exit_reason = f"{reason}_already_closed"  # 标记为已关闭
+                position.exit_reason = "external_closed"  # 外部关闭（在币安手动平仓）
                 self.db.commit()
-                logger.info("持仓 %s 已标记为已关闭（币安上已无持仓）", position.id)
+                log_key_event("INFO", "持仓 %s 已标记为已关闭（外部关闭）", position.id)
                 return
             
             # 如果无法获取实际数量，使用数据库中的数量
@@ -254,24 +559,26 @@ class PositionService:
             except Exception as exc:
                 logger.warning("调整数量精度失败: %s，使用原始数量", exc)
             
-            logger.info("开始平仓持仓 %s (%s %s): 实际数量=%s, 方向=%s, 原因=%s", 
+                log_key_event("INFO", "开始平仓持仓 %s (%s %s): 实际数量=%s, 方向=%s, 原因=%s", 
                        position.id, position.symbol, position.side, 
                        actual_quantity, close_side, reason)
             
             # 使用实际持仓数量平仓，添加 reduceOnly=true 确保这是平仓而不是开新仓
             # 这样可以避免需要额外的保证金（特别是做空持仓平仓时需要买入的情况）
+            position_side_for_exchange = "LONG" if position.side == "BUY" else "SHORT"
             result = self.client.place_market_order(
                 position.symbol,
                 close_side,
                 actual_quantity,
-                reduce_only=True  # 平仓时使用 reduceOnly，避免需要额外保证金
+                reduce_only=True,  # 平仓时使用 reduceOnly，避免需要额外保证金（单向模式）
+                position_side=position_side_for_exchange,
             )
             
             # 记录订单ID
             order_id = result.get("orderId") or result.get("order_id") or str(result.get("clientOrderId", ""))
             order_status = result.get("status", "UNKNOWN")
             
-            logger.info("平仓订单已提交: 订单ID=%s, 状态=%s, 结果=%s", order_id, order_status, result)
+            log_key_event("INFO", "平仓订单已提交: 订单ID=%s, 状态=%s, 结果=%s", order_id, order_status, result)
             
             # 重要：等待订单成交（市价单通常立即成交，但需要确认）
             # 市价单可能初始返回NEW状态，需要等待并查询
@@ -283,7 +590,7 @@ class PositionService:
             # 如果初始状态已经是FILLED，直接处理
             if order_status in ["FILLED", "COMPLETED"]:
                 order_filled = True
-                logger.info("订单立即成交: 订单ID=%s", order_id)
+                log_key_event("INFO", "订单立即成交: 订单ID=%s", order_id)
             else:
                 # 等待订单成交（市价单通常很快成交）
                 # 先等待0.2秒，让订单有时间成交
@@ -302,7 +609,7 @@ class PositionService:
                             actual_quantity = order_info.get("executedQty") or order_info.get("quantity") or position.entry_quantity
                             exit_price = Decimal(str(actual_price))
                             position.exit_quantity = Decimal(str(actual_quantity))
-                            logger.info("订单已成交: 订单ID=%s, 成交价=%s, 成交数量=%s", 
+                            log_key_event("INFO", "订单已成交: 订单ID=%s, 成交价=%s, 成交数量=%s", 
                                        order_id, exit_price, position.exit_quantity)
                             order_filled = True
                             break
@@ -333,7 +640,7 @@ class PositionService:
                                     exit_price = Decimal(str(actual_price))
                                     position.exit_quantity = Decimal(str(actual_quantity))
                                     order_filled = True
-                                    logger.info("使用原始结果: 订单ID=%s, 成交价=%s, 成交数量=%s", 
+                                    log_key_event("INFO", "使用原始结果: 订单ID=%s, 成交价=%s, 成交数量=%s", 
                                              order_id, exit_price, position.exit_quantity)
                                     break
                     
@@ -350,7 +657,7 @@ class PositionService:
                     actual_quantity = result.get("executedQty") or position.entry_quantity
                     exit_price = Decimal(str(actual_price))
                     position.exit_quantity = Decimal(str(actual_quantity))
-                    logger.info("使用原始结果（订单可能已成交）: 订单ID=%s, 成交价=%s, 成交数量=%s", 
+                    log_key_event("INFO", "使用原始结果（订单可能已成交）: 订单ID=%s, 成交价=%s, 成交数量=%s", 
                                order_id, exit_price, position.exit_quantity)
                     order_filled = True
                 else:
@@ -399,9 +706,11 @@ class PositionService:
                 if plan:
                     plan.status = TradePlanStatus.EXITED
                     plan.exit_time = position.exit_time
+            # 更新手动计划状态（如果由手动计划触发）
+            self._finalize_manual_plan_if_needed(position.manual_plan_id, position.id)
             
             self.db.commit()
-            logger.info("持仓 %s 已关闭，原因: %s", position.id, reason)
+            log_key_event("INFO", "持仓 %s 已关闭，原因: %s", position.id, reason)
             
             # 持仓关闭后，取消WebSocket订阅（如果该交易对没有其他活跃持仓）
             if self.settings.websocket_price_enabled:
@@ -478,15 +787,20 @@ class PositionService:
                     default_trailing = Decimal(str(settings.trailing_exit_pct))
                     default_stop_loss = Decimal(str(settings.stop_loss_pct))
                     
+                    # 辅助函数：比较两个Decimal是否相等（处理精度问题）
+                    def is_decimal_equal(d1, d2, epsilon=Decimal("0.0001")):
+                        return abs(d1 - d2) < epsilon
+
                     # 找出有自定义参数的持仓
+                    # 使用宽松比较，防止精度问题导致误判
                     custom_positions = [p for p in positions 
-                                      if p.trailing_exit_pct != default_trailing or 
-                                         p.stop_loss_pct != default_stop_loss]
+                                      if not is_decimal_equal(p.trailing_exit_pct, default_trailing) or 
+                                         not is_decimal_equal(p.stop_loss_pct, default_stop_loss)]
                     
                     if custom_positions:
                         # 保留有自定义参数的持仓（如果有多个，保留最新的）
                         keep_position = max(custom_positions, key=lambda p: p.entry_time)
-                        logger.info("保留持仓 {} (有自定义退出参数: 滑动退出={}%%, 止损={}%%)", 
+                        logger.info("保留持仓 {} (有自定义退出参数: 滑动退出={}%, 止损={}%)", 
                                   keep_position.id,
                                   float(keep_position.trailing_exit_pct) * 100,
                                   float(keep_position.stop_loss_pct) * 100)
@@ -559,22 +873,101 @@ class PositionService:
                         updated_count += 1
                         logger.debug("更新持仓: {} {} 数量={} 价格={}", symbol, side, entry_quantity, entry_price)
                     
-                    # 重要：同步时使用当前标记价格更新最高价和最低价（如果当前价格更高/更低）
-                    # 这确保即使是从外部同步的持仓，也能正确追踪历史最高/最低价
-                    # 使用mark_price（标记价格）而不是entry_price，因为mark_price是当前市场价格
+                    # 改进2：检测系统中断（检查 last_check_time）
                     current_price = Decimal(str(mark_price))
-                    if position.highest_price is None or current_price > position.highest_price:
-                        old_highest = position.highest_price
-                        position.highest_price = current_price
-                        if old_highest is not None:
-                            logger.debug("同步时更新持仓 %s (%s) 历史最高价: %s -> %s", 
-                                       position.id, symbol, old_highest, current_price)
-                    if position.lowest_price is None or current_price < position.lowest_price:
-                        old_lowest = position.lowest_price
-                        position.lowest_price = current_price
-                        if old_lowest is not None:
-                            logger.debug("同步时更新持仓 %s (%s) 历史最低价: %s -> %s", 
-                                       position.id, symbol, old_lowest, current_price)
+                    now = datetime.now(timezone.utc)
+                    last_check = position.last_check_time or position.entry_time or now
+                    time_since_last_check = (now - last_check).total_seconds()
+                    INTERRUPT_THRESHOLD = 300  # 5分钟，超过此时间认为可能中断过
+                    is_likely_interrupted = time_since_last_check > INTERRUPT_THRESHOLD
+                    
+                    # 改进3：如果检测到中断，尝试从K线数据恢复历史最高/最低价
+                    recovered_high = None
+                    recovered_low = None
+                    if is_likely_interrupted and position.last_check_time:
+                        try:
+                            # 计算需要查询的时间范围（从上次检查到现在）
+                            start_time_ms = int(position.last_check_time.timestamp() * 1000)
+                            end_time_ms = int(now.timestamp() * 1000)
+                            
+                            # 获取1分钟K线数据（最多500条，约8小时）
+                            klines = self.client.get_klines(
+                                symbol=symbol,
+                                interval="1m",
+                                limit=500,
+                                start_time=start_time_ms,
+                                end_time=end_time_ms
+                            )
+                            
+                            if klines:
+                                # K线格式：[开盘时间, 开盘价, 最高价, 最低价, 收盘价, ...]
+                                # 提取所有K线的最高价和最低价
+                                kline_highs = [Decimal(str(k[2])) for k in klines]  # 最高价
+                                kline_lows = [Decimal(str(k[3])) for k in klines]   # 最低价
+                                
+                                recovered_high = max(kline_highs) if kline_highs else None
+                                recovered_low = min(kline_lows) if kline_lows else None
+                                
+                                if recovered_high or recovered_low:
+                                    logger.info("检测到系统中断（%.1f分钟），从K线数据恢复历史价格: %s %s 最高价=%s 最低价=%s", 
+                                              time_since_last_check / 60, symbol, side,
+                                              recovered_high, recovered_low)
+                        except Exception as exc:
+                            logger.debug("从K线数据恢复历史价格失败: {}", exc)
+                    
+                    # 更新最高价和最低价（优先使用恢复的数据）
+                    price_updated = False
+                    if recovered_high:
+                        # 使用恢复的最高价和当前价格中的较大值
+                        new_high = max(recovered_high, current_price)
+                        if position.highest_price is None or new_high > position.highest_price:
+                            old_highest = position.highest_price
+                            position.highest_price = new_high
+                            price_updated = True
+                            logger.info("恢复持仓 %s (%s) 历史最高价: %s -> %s (从K线数据恢复)", 
+                                      position.id, symbol, old_highest, new_high)
+                    else:
+                        # 正常更新（使用当前价格）
+                        if position.highest_price is None or current_price > position.highest_price:
+                            old_highest = position.highest_price
+                            position.highest_price = current_price
+                            price_updated = True
+                            if old_highest is not None:
+                                logger.debug("同步时更新持仓 %s (%s) 历史最高价: %s -> %s", 
+                                           position.id, symbol, old_highest, current_price)
+                    
+                    if recovered_low:
+                        # 使用恢复的最低价和当前价格中的较小值
+                        new_low = min(recovered_low, current_price)
+                        if position.lowest_price is None or new_low < position.lowest_price:
+                            old_lowest = position.lowest_price
+                            position.lowest_price = new_low
+                            price_updated = True
+                            logger.info("恢复持仓 %s (%s) 历史最低价: %s -> %s (从K线数据恢复)", 
+                                      position.id, symbol, old_lowest, new_low)
+                    else:
+                        # 正常更新（使用当前价格）
+                        if position.lowest_price is None or current_price < position.lowest_price:
+                            old_lowest = position.lowest_price
+                            position.lowest_price = current_price
+                            price_updated = True
+                            if old_lowest is not None:
+                                logger.debug("同步时更新持仓 %s (%s) 历史最低价: %s -> %s", 
+                                           position.id, symbol, old_lowest, current_price)
+                    
+                    # 如果检测到中断但无法恢复，记录警告并采用保守策略
+                    if is_likely_interrupted and not (recovered_high or recovered_low):
+                        logger.warning("检测到系统中断（%.1f分钟），但无法从K线数据恢复历史价格，将采用保守策略", 
+                                     time_since_last_check / 60)
+                        # 保守策略：如果最高/最低价为None，使用入场价初始化（而不是当前价格）
+                        if position.highest_price is None:
+                            position.highest_price = position.entry_price
+                            logger.info("采用保守策略：持仓 %s (%s) 历史最高价初始化为入场价: %s", 
+                                      position.id, symbol, position.entry_price)
+                        if position.lowest_price is None:
+                            position.lowest_price = position.entry_price
+                            logger.info("采用保守策略：持仓 %s (%s) 历史最低价初始化为入场价: %s", 
+                                      position.id, symbol, position.entry_price)
                     
                     # 重要：强制恢复用户自定义的退出参数（确保不会被覆盖）
                     # 这些值可能已经被用户通过API修改过，必须保持不变
@@ -642,6 +1035,45 @@ class PositionService:
                 if key not in binance_keys:
                     # 币安上可能已关闭，但需要二次确认以避免误关闭
                     if position.status == PositionStatus.ACTIVE:
+                        # 重要：检查该持仓是否已经被系统关闭（通过检查执行日志）
+                        # 如果系统刚刚自动平仓，可能在币安API同步时已经关闭，不应该误判为外部关闭
+                        is_system_closed = False
+                        try:
+                            from app.models.execution_log import ExecutionLog
+                            # 检查最近5分钟内是否有该持仓的系统关闭记录
+                            recent_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+                            recent_close_log = self.db.scalar(
+                                select(ExecutionLog)
+                                .where(ExecutionLog.position_id == position.id)
+                                .where(ExecutionLog.event_type == "position_closed")
+                                .where(ExecutionLog.created_at >= recent_time)
+                                .order_by(ExecutionLog.created_at.desc())
+                                .limit(1)
+                            )
+                            if recent_close_log:
+                                # 从执行日志的payload中获取退出原因
+                                payload = recent_close_log.payload or {}
+                                system_reason = payload.get("reason", "")
+                                if system_reason in ["stop_loss", "trailing_stop"]:
+                                    is_system_closed = True
+                                    logger.info("检测到持仓 {} {} 已被系统关闭（原因: {}），同步时保持系统退出原因", 
+                                              position.symbol, position.side, system_reason)
+                                    # 更新持仓状态，但保留系统设置的退出原因
+                                    position.status = PositionStatus.CLOSED
+                                    if not position.exit_time:
+                                        position.exit_time = recent_close_log.created_at
+                                    if not position.exit_reason:
+                                        position.exit_reason = system_reason
+                                    if not position.exit_price and recent_close_log.price:
+                                        position.exit_price = Decimal(str(recent_close_log.price))
+                                    closed_count += 1
+                        except Exception as exc:
+                            logger.debug("检查系统关闭记录失败: {}，继续二次确认流程", exc)
+                        
+                        # 如果已经被系统关闭，跳过后续的外部关闭检查
+                        if is_system_closed:
+                            continue
+                        
                         # 添加日志，记录即将关闭的持仓信息
                         logger.info("检测到持仓可能在币安上已关闭: {} {} (持仓ID: {})，进行二次确认", 
                                   position.symbol, position.side, position.id)
@@ -663,11 +1095,12 @@ class PositionService:
                                 
                                 if not found:
                                     # 确认不存在，标记为关闭
+                                    # 只有在没有系统关闭记录的情况下，才标记为外部关闭
                                     position.status = PositionStatus.CLOSED
                                     position.exit_time = datetime.now(timezone.utc)
                                     position.exit_reason = "external_closed"  # 外部关闭（在币安手动平仓）
                                     closed_count += 1
-                                    logger.info("确认持仓已关闭（币安二次确认）: {} {}", position.symbol, position.side)
+                                    logger.info("确认持仓已关闭（币安二次确认，外部关闭）: {} {}", position.symbol, position.side)
                                 else:
                                     logger.warning("持仓 {} {} 在二次确认时发现仍存在，保持ACTIVE状态（可能是API延迟）", 
                                                  position.symbol, position.side)
@@ -697,3 +1130,53 @@ class PositionService:
             self.db.rollback()
             return {"created": 0, "updated": 0, "closed": 0}
 
+    def _calculate_realized_pnl(self, position: Position) -> Decimal:
+        if not position.exit_price or position.exit_quantity is None:
+            return Decimal("0")
+        qty = position.exit_quantity or position.entry_quantity
+        if not qty or qty <= 0:
+            qty = position.entry_quantity
+        if not qty or qty <= 0:
+            return Decimal("0")
+        qty_dec = Decimal(str(qty))
+        entry_price = Decimal(str(position.entry_price))
+        exit_price = Decimal(str(position.exit_price))
+        if position.side == "BUY":
+            pnl = (exit_price - entry_price) * qty_dec
+        else:
+            pnl = (entry_price - exit_price) * qty_dec
+        return pnl
+
+    def get_realized_pnl_summary(self, days: int = 30) -> dict:
+        """返回最近 n 天的每日收益和累计收益"""
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=days)
+        stmt = (
+            select(Position)
+            .where(Position.status == PositionStatus.CLOSED)
+            .where(Position.exit_time.isnot(None))
+            .where(Position.exit_time >= start_time)
+            .order_by(Position.exit_time.desc())
+        )
+        positions = list(self.db.scalars(stmt))
+        daily = defaultdict(Decimal)
+        total = Decimal("0")
+        for pos in positions:
+            pnl = self._calculate_realized_pnl(pos)
+            if pnl == 0:
+                continue
+            exit_time = pos.exit_time or end_time
+            date_key = exit_time.astimezone(timezone.utc).date().isoformat()
+            daily[date_key] += pnl
+            total += pnl
+        today_key = end_time.astimezone(timezone.utc).date().isoformat()
+        daily_list = [
+            {"date": date, "pnl": float(amount)}
+            for date, amount in sorted(daily.items())
+        ]
+        return {
+            "daily": daily_list,
+            "total_pnl": float(total),
+            "today_pnl": float(daily.get(today_key, Decimal("0"))),
+            "days": days,
+        }
