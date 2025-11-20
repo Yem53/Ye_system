@@ -13,6 +13,7 @@ class ManualPlanBase(BaseModel):
     position_pct: float = Field(0.5, description="仓位比例，使用可用保证金的百分比（默认0.5即50%） / Position percentage, % of available margin (default: 0.5 = 50%)")
     trailing_exit_pct: float = Field(0.15, description="滑动退出百分比，从最高价回撤的百分比（默认0.15即15%） / Trailing exit %, pullback from high (default: 0.15 = 15%)")
     stop_loss_pct: float = Field(0.05, description="止损百分比，从入场价下跌的百分比（默认0.05即5%） / Stop loss %, drop from entry (default: 0.05 = 5%)")
+    max_slippage_pct: float = Field(0.5, description="最大允许滑点百分比（默认0.5%%） / Max allowed slippage percentage (default 0.5%)")
     notes: str | None = Field(None, description="备注，可选 / Notes, optional")
 
 

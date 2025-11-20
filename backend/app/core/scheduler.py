@@ -40,7 +40,10 @@ logger.info("线程池配置: 监控任务={}个工作线程, 同步任务={}个
 # 动态刷新频率状态（模块级别变量）
 MIN_MANUAL_EXECUTOR_INTERVAL: float = 0.3  # 避免调度器堆积的最小间隔
 MIN_POSITION_MONITOR_INTERVAL: float = 0.5  # 持仓监控的最小间隔（秒），保证高精度
-MONITOR_TIMEOUT: float = 0.5  # 监控任务超时阈值（秒），设置为与最小监控间隔一致，避免正常执行被误判为超时
+MONITOR_TIMEOUT: float = 0.7  # 轻度告警阈值（秒），超过后记录warning但继续等待当前任务完成
+MAX_MONITOR_RUNTIME: float = 3.0  # 硬性超时阈值（秒），超过后才强制重置
+SYNC_TIMEOUT: float = 3.0  # 同步任务的轻度告警阈值（秒）
+MAX_SYNC_RUNTIME: float = 12.0  # 同步任务的硬性超时阈值（秒）
 _current_position_monitor_interval: float = MIN_POSITION_MONITOR_INTERVAL  # 初始值：使用最小间隔
 _current_manual_executor_interval: float = MIN_MANUAL_EXECUTOR_INTERVAL  # 初始值：使用最小间隔
 _last_binance_sync_ts: float = 0.0  # 上次同步币安持仓的时间戳
@@ -302,10 +305,12 @@ def start_scheduler() -> None:
         # 检查上次同步是否超时（超过10秒认为超时）
         if _sync_positions_running:
             elapsed = time.time() - _sync_start_time
-            if elapsed > 10.0:
-                logger.warning("同步任务执行超时（{:.2f}秒），强制重置", elapsed)
+            if elapsed > MAX_SYNC_RUNTIME:
+                logger.error("同步任务运行超过 {:.2f} 秒，强制重置", elapsed)
                 _sync_positions_running = False
             else:
+                if elapsed > SYNC_TIMEOUT:
+                    logger.warning("同步任务执行时间过长: {:.2f}秒（等待当前任务完成）", elapsed)
                 return
         
         _sync_positions_running = True
@@ -344,10 +349,12 @@ def start_scheduler() -> None:
         # 检查上次任务是否超时（超过400ms认为可能有问题）
         if _monitor_positions_running:
             elapsed = time.time() - _monitor_start_time
-            if elapsed > MONITOR_TIMEOUT:
-                logger.warning("监控任务执行超时（{:.2f}秒），强制重置", elapsed)
+            if elapsed > MAX_MONITOR_RUNTIME:
+                logger.error("监控任务运行超过 {:.2f} 秒，强制重置", elapsed)
                 _monitor_positions_running = False
             else:
+                if elapsed > MONITOR_TIMEOUT:
+                    logger.warning("监控任务执行时间过长: {:.2f}秒（等待当前任务完成）", elapsed)
                 # 正常执行中，跳过本次（避免堆积）
                 return
         

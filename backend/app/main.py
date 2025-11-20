@@ -124,6 +124,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
             "default_position_pct": current_settings.position_pct,
             "default_trailing_exit_pct": current_settings.trailing_exit_pct,
             "default_stop_loss_pct": current_settings.stop_loss_pct,
+            "default_max_slippage_pct": current_settings.max_slippage_pct,
         },
     )
 
@@ -150,6 +151,7 @@ def submit_manual_plan(
     position_pct: float = Form(None),
     trailing_exit_pct: float = Form(None),
     stop_loss_pct: float = Form(None),
+    max_slippage_pct: float = Form(None),
     notes: str = Form(""),
     db: Session = Depends(get_db),
 ):
@@ -165,6 +167,8 @@ def submit_manual_plan(
         trailing_exit_pct = current_settings.trailing_exit_pct
     if stop_loss_pct is None:
         stop_loss_pct = current_settings.stop_loss_pct
+    if max_slippage_pct is None:
+        max_slippage_pct = current_settings.max_slippage_pct
     try:
         parsed_time = datetime.fromisoformat(listing_time)
         if parsed_time.tzinfo is None:
@@ -184,6 +188,7 @@ def submit_manual_plan(
             "position_pct": position_pct,
             "trailing_exit_pct": trailing_exit_pct,
             "stop_loss_pct": stop_loss_pct,
+            "max_slippage_pct": max_slippage_pct,
             "notes": notes or None,
         }
     )

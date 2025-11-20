@@ -145,6 +145,7 @@ def get_realtime_positions(db: Session = Depends(get_db)):
             "is_external": pos.is_external,  # 是否为非系统下单的持仓
             "stop_loss_pct": float(pos.stop_loss_pct),  # 止损百分比
             "trailing_exit_pct": float(pos.trailing_exit_pct),  # 滑动退出百分比
+            "max_slippage_pct": float(pos.max_slippage_pct) if getattr(pos, "max_slippage_pct", None) is not None else None,
         })
     
     return result
@@ -348,6 +349,7 @@ def get_realtime_dashboard(
                 "entry_time": pos.entry_time.isoformat() if pos.entry_time else None,
                 "stop_loss_pct": float(pos.stop_loss_pct),  # 止损百分比
                 "trailing_exit_pct": float(pos.trailing_exit_pct),  # 滑动退出百分比
+                "max_slippage_pct": float(pos.max_slippage_pct) if getattr(pos, "max_slippage_pct", None) is not None else None,
                 "highest_price": float(pos.highest_price) if pos.highest_price else None,  # 历史最高价（用于滑动退出）
                 "lowest_price": float(pos.lowest_price) if pos.lowest_price else None,  # 历史最低价（用于滑动退出）
                 "trailing_stop_price": trailing_stop_price,  # 滑动退出触发价
@@ -476,6 +478,7 @@ def get_trading_history(
                 "leverage": float(pos.leverage) if pos.leverage else None,
                 "stop_loss_pct": float(pos.stop_loss_pct) if pos.stop_loss_pct else None,
                 "trailing_exit_pct": float(pos.trailing_exit_pct) if pos.trailing_exit_pct else None,
+                "max_slippage_pct": float(pos.max_slippage_pct) if getattr(pos, "max_slippage_pct", None) is not None else None,
                 "highest_price": float(pos.highest_price) if pos.highest_price else None,
                 "lowest_price": float(pos.lowest_price) if pos.lowest_price else None,
                 "pnl_pct": pnl_pct,  # 盈亏百分比

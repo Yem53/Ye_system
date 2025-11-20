@@ -20,6 +20,7 @@ class TradePlan(Base):
     max_allocation = Column(Numeric(32, 8), nullable=True)
     trailing_exit_pct = Column(Numeric(5, 4), nullable=False, default=0.15)
     stop_loss_pct = Column(Numeric(5, 4), nullable=False, default=0.05)
+    max_slippage_pct = Column(Numeric(5, 4), nullable=False, default=0.5)
     status = Column(Enum(TradePlanStatus), default=TradePlanStatus.DRAFT, nullable=False)
     planned_entry_time = Column(DateTime(timezone=True), nullable=True)
     actual_entry_time = Column(DateTime(timezone=True), nullable=True)

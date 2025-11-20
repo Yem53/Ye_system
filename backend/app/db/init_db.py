@@ -96,6 +96,24 @@ def ensure_execution_log_schema() -> None:
         ),
         text(
             """
+            ALTER TABLE manual_plans_codex
+            ADD COLUMN IF NOT EXISTS max_slippage_pct NUMERIC(5, 4) DEFAULT 0.5 NOT NULL
+            """
+        ),
+        text(
+            """
+            ALTER TABLE trade_plans_codex
+            ADD COLUMN IF NOT EXISTS max_slippage_pct NUMERIC(5, 4) DEFAULT 0.5 NOT NULL
+            """
+        ),
+        text(
+            """
+            ALTER TABLE positions_codex
+            ADD COLUMN IF NOT EXISTS max_slippage_pct NUMERIC(5, 4) DEFAULT 0.5 NOT NULL
+            """
+        ),
+        text(
+            """
             DO $$
             BEGIN
                 IF NOT EXISTS (

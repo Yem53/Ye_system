@@ -14,6 +14,7 @@ class TradePlanBase(BaseModel):
     max_allocation: float | None = None
     trailing_exit_pct: float
     stop_loss_pct: float
+    max_slippage_pct: float = 0.5
     planned_entry_time: datetime | None = None
     extra: dict[str, Any] | None = None
 

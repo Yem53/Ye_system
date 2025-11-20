@@ -19,6 +19,7 @@ class ManualPlan(Base):
     position_pct = Column(Numeric(5, 4), nullable=False, default=0.5)
     trailing_exit_pct = Column(Numeric(5, 4), nullable=False, default=0.15)
     stop_loss_pct = Column(Numeric(5, 4), nullable=False, default=0.05)
+    max_slippage_pct = Column(Numeric(5, 4), nullable=False, default=0.5)
     notes = Column(Text, nullable=True)
     status = Column(Enum(ManualPlanStatus), default=ManualPlanStatus.PENDING, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)

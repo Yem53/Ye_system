@@ -39,6 +39,7 @@ class Position(Base):
     leverage = Column(Numeric(10, 2), nullable=False)
     trailing_exit_pct = Column(Numeric(5, 4), nullable=False)
     stop_loss_pct = Column(Numeric(5, 4), nullable=False)
+    max_slippage_pct = Column(Numeric(5, 4), nullable=False, default=0.5)
     
     # 跟踪信息
     highest_price = Column(Numeric(32, 8), nullable=True)  # 持仓期间最高价

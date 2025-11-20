@@ -47,6 +47,12 @@ def log_key_event(level: str, message: str, *args, **kwargs) -> None:
     """用于标记必须输出到终端的关键事件。"""
 
     normalized = _normalize_level(level, "INFO")
+    if args and "%s" in message:
+        try:
+            message = message % args
+            args = ()
+        except Exception:
+            pass
     logger.bind(key_event=True).log(normalized, message, *args, **kwargs)
 
 

@@ -122,6 +122,11 @@
                 <input class="input" name="stop_loss_pct" value="{{ default_stop_loss_pct }}" type="number" step="0.01" min="0" max="1" required>
                 <p class="help">从入场价下跌的百分比 (0.05 = 5%) / % drop from entry</p>
             </div>
+            <div class="column is-one-quarter">
+                <label class="label">最大滑点% / Max Slippage %</label>
+                <input class="input" name="max_slippage_pct" value="{{ default_max_slippage_pct }}" type="number" step="0.01" min="0" required>
+                <p class="help">仅对市价单有效 (0.5 = 0.5%) / Applies to market orders only</p>
+            </div>
             <div class="column is-full">
                 <label class="label">备注 / Notes</label>
                 <textarea class="textarea" name="notes" placeholder="可留空，用于记录测试信息等 / Optional notes"></textarea>

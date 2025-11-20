@@ -51,7 +51,13 @@ class ExecutionService:
         quantity = allocation * leverage_to_use / symbol_price
         return quantity.quantize(Decimal("0.001"))
 
-    def _check_slippage(self, expected_price: Decimal, actual_price: Decimal, side: str) -> tuple[bool, float]:
+    def _check_slippage(
+        self,
+        expected_price: Decimal,
+        actual_price: Decimal,
+        side: str,
+        max_slippage_pct: float | None = None,
+    ) -> tuple[bool, float]:
         """检查滑点是否在允许范围内
         
         Returns:
@@ -65,17 +71,19 @@ class ExecutionService:
         else:  # SELL
             slippage_pct = float((expected_price - actual_price) / expected_price * 100)
         
-        max_slippage = self.settings.max_slippage_pct
+        max_slippage = max_slippage_pct if max_slippage_pct is not None else self.settings.max_slippage_pct
         is_valid = slippage_pct <= max_slippage
         
         return is_valid, slippage_pct
 
     def _place_order_with_slippage_check(
-        self, 
-        symbol: str, 
-        side: str, 
-        quantity: Decimal, 
-        expected_price: Decimal
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        expected_price: Decimal,
+        *,
+        max_slippage_pct: float | None = None,
     ) -> dict:
         """根据配置的订单类型下单，并检查滑点"""
         order_type = self.settings.order_type.upper()
@@ -111,7 +119,9 @@ class ExecutionService:
             # 检查滑点（如果订单已成交）
             if order_result.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED"]:
                 actual_price = Decimal(str(order_result.get("avgPrice", expected_price))) if order_result.get("avgPrice") else expected_price
-                is_valid, slippage_pct = self._check_slippage(expected_price, actual_price, side)
+                is_valid, slippage_pct = self._check_slippage(
+                    expected_price, actual_price, side, max_slippage_pct=max_slippage_pct
+                )
                 
                 if not is_valid:
                     logger.warning(
@@ -128,7 +138,9 @@ class ExecutionService:
         symbol: str,
         side: str,
         quantity: Decimal,
-        expected_price: Decimal
+        expected_price: Decimal,
+        *,
+        max_slippage_pct: float | None = None,
     ) -> dict:
         """下单，如果是限价单且超时未成交，则取消并转为市价单"""
         order_type = self.settings.order_type.upper()
@@ -140,7 +152,9 @@ class ExecutionService:
             
             if not order_id:
                 logger.warning("限价单下单失败，未返回订单ID，转为市价单")
-                return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+                return self._place_order_with_slippage_check(
+                    symbol, side, quantity, expected_price, max_slippage_pct=max_slippage_pct
+                )
             
             # 等待订单成交
             timeout = self.settings.limit_order_timeout_seconds
@@ -154,7 +168,9 @@ class ExecutionService:
             elif initial_status in ["CANCELED", "REJECTED", "EXPIRED"]:
                 logger.warning("限价单被拒绝/取消/过期: {}, 状态: {}", order_id, initial_status)
                 # 立即转为市价单
-                return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+                return self._place_order_with_slippage_check(
+                    symbol, side, quantity, expected_price, max_slippage_pct=max_slippage_pct
+                )
             
             # 如果订单状态是 NEW 或 PARTIALLY_FILLED，等待成交
             while time.time() - start_time < timeout:
@@ -188,9 +204,13 @@ class ExecutionService:
             
             # 转为市价单
             log_key_event("INFO", "限价单未成交，转为市价单")
-            return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+            return self._place_order_with_slippage_check(
+                symbol, side, quantity, expected_price, max_slippage_pct=max_slippage_pct
+            )
         else:
-            return self._place_order_with_slippage_check(symbol, side, quantity, expected_price)
+            return self._place_order_with_slippage_check(
+                symbol, side, quantity, expected_price, max_slippage_pct=max_slippage_pct
+            )
 
     def execute_plan(self, plan: TradePlan, side: str = "BUY", price_hint: Optional[Decimal] = None) -> None:
         """执行交易计划（市价单建仓），记录订单详情并创建持仓。"""
@@ -214,8 +234,14 @@ class ExecutionService:
         # 使用计划中的杠杆计算订单数量
         quantity = self.calculate_order_size(mark_price, balance, leverage=plan.leverage)
         
-        # 执行订单（根据配置选择市价单或限价单，并检查滑点）
-        order_result = self._place_order_with_timeout(symbol, side, quantity, mark_price)
+        plan_slippage_pct = (
+            float(plan.max_slippage_pct)
+            if getattr(plan, "max_slippage_pct", None) is not None
+            else self.settings.max_slippage_pct
+        )
+        order_result = self._place_order_with_timeout(
+            symbol, side, quantity, mark_price, max_slippage_pct=plan_slippage_pct
+        )
         order_id = str(order_result.get("orderId") or order_result.get("order_id") or order_result.get("clientOrderId", ""))
         
         # 检查订单状态，确保订单已成交
@@ -256,6 +282,7 @@ class ExecutionService:
             leverage=plan.leverage,
             trailing_exit_pct=plan.trailing_exit_pct,
             stop_loss_pct=plan.stop_loss_pct,
+             max_slippage_pct=plan.max_slippage_pct,
             highest_price=actual_price,
             lowest_price=actual_price,
             last_check_time=datetime.now(timezone.utc),
@@ -341,7 +368,18 @@ class ExecutionService:
             self.settings.position_pct = original_position_pct
         
         # 执行订单（根据配置选择市价单或限价单，并检查滑点）
-        order_result = self._place_order_with_timeout(symbol, plan.side.upper(), quantity, mark_price)
+        plan_slippage_pct = (
+            float(plan.max_slippage_pct)
+            if getattr(plan, "max_slippage_pct", None) is not None
+            else self.settings.max_slippage_pct
+        )
+        order_result = self._place_order_with_timeout(
+            symbol,
+            plan.side.upper(),
+            quantity,
+            mark_price,
+            max_slippage_pct=plan_slippage_pct,
+        )
         order_id = str(order_result.get("orderId") or order_result.get("order_id") or order_result.get("clientOrderId", ""))
         
         # 检查订单状态，确保订单已成交
@@ -384,6 +422,7 @@ class ExecutionService:
             leverage=plan.leverage,
             trailing_exit_pct=plan.trailing_exit_pct,
             stop_loss_pct=plan.stop_loss_pct,
+            max_slippage_pct=plan.max_slippage_pct,
             highest_price=actual_price,
             lowest_price=actual_price,
             last_check_time=datetime.now(timezone.utc),

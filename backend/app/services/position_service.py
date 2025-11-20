@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal
-from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 import os
 import time
+from threading import Lock
 
 from loguru import logger
 from sqlalchemy import select, update
@@ -22,6 +23,9 @@ from app.models.execution_log import ExecutionLog
 from app.services.binance_service import BinanceFuturesClient
 from app.services.execution_service import ExecutionService
 
+_closing_positions: set[str] = set()
+_closing_lock = Lock()
+
 
 class PositionService:
     """实时监控持仓并执行退出策略"""
@@ -33,11 +37,22 @@ class PositionService:
         self.executor = ExecutionService(db, settings)
 
     def _has_system_execution_record(self, position: Position) -> bool:
-        """判断该持仓是否有系统成交记录（order_filled）"""
+        """判断该持仓是否有系统成交记录（order_filled）或系统关闭记录（position_closed）"""
+        # 检查是否有 order_filled 记录（系统下单成交）
         stmt = (
             select(ExecutionLog.id)
             .where(ExecutionLog.position_id == position.id)
             .where(ExecutionLog.event_type == "order_filled")
+            .limit(1)
+        )
+        if self.db.scalar(stmt) is not None:
+            return True
+        
+        # 检查是否有 position_closed 记录（系统关闭订单）
+        stmt = (
+            select(ExecutionLog.id)
+            .where(ExecutionLog.position_id == position.id)
+            .where(ExecutionLog.event_type == "position_closed")
             .limit(1)
         )
         return self.db.scalar(stmt) is not None
@@ -540,143 +555,155 @@ class PositionService:
                 logger.debug("持仓 %s 已经关闭，跳过重复关闭操作", position.id)
                 return
             
-            # 平仓（反向操作）
-            close_side = "SELL" if position.side == "BUY" else "BUY"
-            
-            # 重要：从币安获取实际持仓数量，而不是使用数据库中的entry_quantity
-            # 因为实际持仓可能已经变化（部分平仓、加仓等）
-            actual_quantity = None
-            position_found_on_binance = False
-            positions_fetch_failed = False
-            binance_positions = self.client.get_positions_from_binance()
-            if binance_positions is None:
-                positions_fetch_failed = True
-                binance_positions = []
-            for binance_pos in binance_positions:
-                if (binance_pos["symbol"] == position.symbol and 
-                    binance_pos["side"] == position.side):
-                    actual_quantity = Decimal(str(binance_pos["position_amt"]))
-                    position_found_on_binance = True
-                    logger.info("从币安获取实际持仓数量: %s %s = %s (数据库数量: %s)", 
-                               position.symbol, position.side, actual_quantity, position.entry_quantity)
-                    break
-            
-            # 如果币安上已经没有这个持仓了，需要判断是系统刚关闭还是外部关闭
-            if not position_found_on_binance:
-                if positions_fetch_failed:
-                    logger.warning("无法获取币安持仓状态，暂不标记 %s %s 为外部关闭，等待下次检查", 
-                                 position.symbol, position.side)
+            position_id = str(position.id)
+            with _closing_lock:
+                if position_id in _closing_positions:
+                    logger.debug("持仓 %s 正在平仓，跳过重复请求", position_id)
                     return
-                # 再次检查持仓状态（可能在检查币安持仓时，其他线程已经关闭了）
-                self.db.refresh(position)
-                if position.status == PositionStatus.CLOSED:
-                    logger.debug("持仓 %s 在检查币安持仓期间已被关闭，跳过重复关闭操作", position.id)
-                    return
-                
-                # 检查是否有最近的系统关闭记录（5分钟内）
-                try:
-                    from app.models.execution_log import ExecutionLog
-                    recent_time = datetime.now(timezone.utc) - timedelta(minutes=5)
-                    recent_close_log = self.db.scalar(
-                        select(ExecutionLog)
-                        .where(ExecutionLog.position_id == position.id)
-                        .where(ExecutionLog.event_type == "position_closed")
-                        .where(ExecutionLog.created_at >= recent_time)
-                        .order_by(ExecutionLog.created_at.desc())
-                        .limit(1)
-                    )
-                    if recent_close_log:
-                        # 有系统关闭记录，说明是系统刚关闭的，使用系统设置的退出原因
-                        payload = recent_close_log.payload or {}
-                        system_reason = payload.get("reason", reason)
-                        logger.info("币安上已无持仓 %s %s，但检测到系统关闭记录（原因: %s），使用系统退出原因", 
-                                  position.symbol, position.side, system_reason)
-                        # 再次检查状态（避免并发问题）
-                        self.db.refresh(position)
-                        if position.status == PositionStatus.CLOSED:
-                            logger.debug("持仓 %s 在检查关闭记录期间已被关闭，跳过重复关闭操作", position.id)
-                            return
-                        reason_used = self._finalize_missing_position(
-                            position,
-                            exit_price if exit_price else (Decimal(str(recent_close_log.price)) if recent_close_log.price else position.entry_price),
-                            default_reason=system_reason,
-                        )
-                        self.db.commit()
-                        log_key_event("INFO", "持仓 %s 已标记为已关闭（系统关闭，原因: %s）", position.id, reason_used)
-                        return
-                except Exception as exc:
-                    logger.debug("检查系统关闭记录失败: %s，继续处理", exc)
-                
-                # 没有系统关闭记录，可能是外部手动平仓
-                # 再次检查状态（避免并发问题）
-                self.db.refresh(position)
-                if position.status == PositionStatus.CLOSED:
-                    logger.debug("持仓 %s 在检查期间已被关闭，跳过重复关闭操作", position.id)
-                    return
-                if not self._confirm_position_absent_on_binance(position.symbol, position.side):
-                    logger.info("再次检查后发现持仓 %s %s 仍存在或无法确认，保持 ACTIVE 状态", position.symbol, position.side)
-                    return
-                reason_used = self._finalize_missing_position(position, exit_price or position.entry_price, default_reason="external_closed")
-                self.db.commit()
-                if reason_used == "external_closed":
-                    log_key_event("INFO", "持仓 %s 已标记为已关闭（外部关闭）", position.id)
-                else:
-                    log_key_event("INFO", "持仓 %s 已标记为未执行（未检测到系统成交记录）", position.id)
-                return
-            
-            # 如果无法获取实际数量，使用数据库中的数量
-            if actual_quantity is None or actual_quantity <= 0:
-                actual_quantity = position.entry_quantity
-                logger.warning("使用数据库中的持仓数量: %s (可能不准确)", actual_quantity)
-            
-            # 验证数量是否有效
-            if actual_quantity <= 0:
-                error_msg = f"持仓数量无效: {actual_quantity}，无法平仓"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-            
-            # 确保数量精度正确（获取交易对的stepSize并调整）
+                _closing_positions.add(position_id)
             try:
-                symbol_info = self.client.get_symbol_info(position.symbol)
-                step_size = symbol_info.get("stepSize", Decimal("0.1"))
-                from decimal import ROUND_DOWN
-                # 根据stepSize调整数量精度
-                if step_size < 1:
-                    actual_quantity = (actual_quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * step_size
-                else:
-                    actual_quantity = (actual_quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * step_size
+                # 平仓（反向操作）
+                close_side = "SELL" if position.side == "BUY" else "BUY"
                 
-                # 再次验证调整后的数量
+                # 重要：从币安获取实际持仓数量，而不是使用数据库中的entry_quantity
+                # 因为实际持仓可能已经变化（部分平仓、加仓等）
+                actual_quantity = None
+                position_found_on_binance = False
+                positions_fetch_failed = False
+                binance_positions = self.client.get_positions_from_binance()
+                if binance_positions is None:
+                    positions_fetch_failed = True
+                    binance_positions = []
+                for binance_pos in binance_positions:
+                    if (binance_pos["symbol"] == position.symbol and 
+                        binance_pos["side"] == position.side):
+                        actual_quantity = Decimal(str(binance_pos["position_amt"]))
+                        position_found_on_binance = True
+                        logger.info("从币安获取实际持仓数量: %s %s = %s (数据库数量: %s)", 
+                                   position.symbol, position.side, actual_quantity, position.entry_quantity)
+                        break
+                
+                # 如果币安上已经没有这个持仓了，需要判断是系统刚关闭还是外部关闭
+                if not position_found_on_binance:
+                    if positions_fetch_failed:
+                        logger.warning("无法获取币安持仓状态，暂不标记 %s %s 为外部关闭，等待下次检查", 
+                                     position.symbol, position.side)
+                        return
+                    # 再次检查持仓状态（可能在检查币安持仓时，其他线程已经关闭了）
+                    self.db.refresh(position)
+                    if position.status == PositionStatus.CLOSED:
+                        logger.debug("持仓 %s 在检查币安持仓期间已被关闭，跳过重复关闭操作", position.id)
+                        return
+                    
+                    # 检查是否有最近的系统关闭记录（5分钟内）
+                    try:
+                        from app.models.execution_log import ExecutionLog
+                        recent_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+                        recent_close_log = self.db.scalar(
+                            select(ExecutionLog)
+                            .where(ExecutionLog.position_id == position.id)
+                            .where(ExecutionLog.event_type == "position_closed")
+                            .where(ExecutionLog.created_at >= recent_time)
+                            .order_by(ExecutionLog.created_at.desc())
+                            .limit(1)
+                        )
+                        if recent_close_log:
+                            # 有系统关闭记录，说明是系统刚关闭的，使用系统设置的退出原因
+                            payload = recent_close_log.payload or {}
+                            system_reason = payload.get("reason", reason)
+                            logger.info("币安上已无持仓 %s %s，但检测到系统关闭记录（原因: %s），使用系统退出原因", 
+                                      position.symbol, position.side, system_reason)
+                            # 再次检查状态（避免并发问题）
+                            self.db.refresh(position)
+                            if position.status == PositionStatus.CLOSED:
+                                logger.debug("持仓 %s 在检查关闭记录期间已被关闭，跳过重复关闭操作", position.id)
+                                return
+                            reason_used = self._finalize_missing_position(
+                                position,
+                                exit_price if exit_price else (Decimal(str(recent_close_log.price)) if recent_close_log.price else position.entry_price),
+                                default_reason=system_reason,
+                            )
+                            self.db.commit()
+                            log_key_event("INFO", f"持仓 {position.id} 已标记为已关闭（系统关闭，原因: {reason_used}）")
+                            return
+                    except Exception as exc:
+                        logger.debug("检查系统关闭记录失败: %s，继续处理", exc)
+                    
+                    # 没有系统关闭记录，可能是外部手动平仓
+                    # 再次检查状态（避免并发问题）
+                    self.db.refresh(position)
+                    if position.status == PositionStatus.CLOSED:
+                        logger.debug("持仓 %s 在检查期间已被关闭，跳过重复关闭操作", position.id)
+                        return
+                    if not self._confirm_position_absent_on_binance(position.symbol, position.side):
+                        logger.info("再次检查后发现持仓 %s %s 仍存在或无法确认，保持 ACTIVE 状态", position.symbol, position.side)
+                        return
+                    reason_used = self._finalize_missing_position(position, exit_price or position.entry_price, default_reason="external_closed")
+                    self.db.commit()
+                    if reason_used == "external_closed":
+                        log_key_event("INFO", f"持仓 {position.id} 已标记为已关闭（外部关闭）")
+                    else:
+                        log_key_event("INFO", f"持仓 {position.id} 已标记为未执行（未检测到系统成交记录）")
+                    return
+                
+                # 如果无法获取实际数量，使用数据库中的数量
+                if actual_quantity is None or actual_quantity <= 0:
+                    actual_quantity = position.entry_quantity
+                    logger.warning("使用数据库中的持仓数量: %s (可能不准确)", actual_quantity)
+                
+                # 验证数量是否有效
                 if actual_quantity <= 0:
-                    error_msg = f"调整精度后持仓数量无效: {actual_quantity}，无法平仓"
+                    error_msg = f"持仓数量无效: {actual_quantity}，无法平仓"
                     logger.error(error_msg)
                     raise ValueError(error_msg)
                 
-                logger.info("数量精度已调整: 原始=%s, 调整后=%s, stepSize=%s", 
-                           position.entry_quantity, actual_quantity, step_size)
-            except Exception as exc:
-                logger.warning("调整数量精度失败: %s，使用原始数量", exc)
+                # 确保数量精度正确（获取交易对的stepSize并调整）
+                try:
+                    symbol_info = self.client.get_symbol_info(position.symbol)
+                    step_size = symbol_info.get("stepSize", Decimal("0.1"))
+                    from decimal import ROUND_DOWN
+                    # 根据stepSize调整数量精度
+                    if step_size < 1:
+                        actual_quantity = (actual_quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * step_size
+                    else:
+                        actual_quantity = (actual_quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN) * step_size
+                    
+                    # 再次验证调整后的数量
+                    if actual_quantity <= 0:
+                        error_msg = f"调整精度后持仓数量无效: {actual_quantity}，无法平仓"
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    logger.info("数量精度已调整: 原始=%s, 调整后=%s, stepSize=%s", 
+                               position.entry_quantity, actual_quantity, step_size)
+                except Exception as exc:
+                    logger.warning("调整数量精度失败: %s，使用原始数量", exc)
+                
+                log_key_event(
+                    "INFO",
+                    f"开始平仓持仓 {position.id} ({position.symbol} {position.side}): 实际数量={actual_quantity}, 方向={close_side}, 原因={reason}",
+                )
+                
+                # 在下单前再次检查持仓状态（避免并发问题）
+                self.db.refresh(position)
+                if position.status == PositionStatus.CLOSED:
+                    logger.debug("持仓 %s 在下单前已被关闭，跳过重复下单", position.id)
+                    return
+                
+                # 使用实际持仓数量平仓，添加 reduceOnly=true 确保这是平仓而不是开新仓
+                # 这样可以避免需要额外的保证金（特别是做空持仓平仓时需要买入的情况）
+                position_side_for_exchange = "LONG" if position.side == "BUY" else "SHORT"
+                result = self.client.place_market_order(
+                    position.symbol,
+                    close_side,
+                    actual_quantity,
+                    reduce_only=True,  # 平仓时使用 reduceOnly，避免需要额外保证金（单向模式）
+                    position_side=position_side_for_exchange,
+                )
             
-                log_key_event("INFO", "开始平仓持仓 %s (%s %s): 实际数量=%s, 方向=%s, 原因=%s", 
-                       position.id, position.symbol, position.side, 
-                       actual_quantity, close_side, reason)
-            
-            # 在下单前再次检查持仓状态（避免并发问题）
-            self.db.refresh(position)
-            if position.status == PositionStatus.CLOSED:
-                logger.debug("持仓 %s 在下单前已被关闭，跳过重复下单", position.id)
-                return
-            
-            # 使用实际持仓数量平仓，添加 reduceOnly=true 确保这是平仓而不是开新仓
-            # 这样可以避免需要额外的保证金（特别是做空持仓平仓时需要买入的情况）
-            position_side_for_exchange = "LONG" if position.side == "BUY" else "SHORT"
-            result = self.client.place_market_order(
-                position.symbol,
-                close_side,
-                actual_quantity,
-                reduce_only=True,  # 平仓时使用 reduceOnly，避免需要额外保证金（单向模式）
-                position_side=position_side_for_exchange,
-            )
+            finally:
+                with _closing_lock:
+                    _closing_positions.discard(position_id)
             
             # 记录订单ID
             order_id = result.get("orderId") or result.get("order_id") or str(result.get("clientOrderId", ""))
@@ -857,6 +884,12 @@ class PositionService:
         返回: {"created": 创建数量, "updated": 更新数量, "closed": 关闭数量}
         """
         try:
+            # 每次同步时重新加载系统配置，确保使用最新默认值
+            current_settings = get_settings()
+            self.settings = current_settings
+            default_trailing_pct = Decimal(str(current_settings.trailing_exit_pct))
+            default_stop_loss_pct = Decimal(str(current_settings.stop_loss_pct))
+            
             # 从币安获取所有实际持仓
             binance_positions = self.client.get_positions_from_binance()
             
@@ -968,6 +1001,14 @@ class PositionService:
                     # 这些值可能已经被用户通过API修改过，必须保持不变
                     saved_trailing_exit_pct = position.trailing_exit_pct
                     saved_stop_loss_pct = position.stop_loss_pct
+                    saved_max_slippage_pct = getattr(position, "max_slippage_pct", None)
+                    
+                    # 外部持仓：只在首次同步时使用系统默认值，之后保持用户手动设置的值
+                    # 判断是否首次同步：如果参数等于系统默认值，可能是首次同步或用户恰好设置为默认值
+                    # 为了区分，我们检查是否有用户手动修改的痕迹（通过检查参数是否与默认值不同）
+                    # 如果用户手动修改过（不等于默认值），则保持用户设置的值
+                    # 如果等于默认值，可能是首次同步，也可能是用户设置为默认值，这种情况下保持当前值即可
+                    # 注意：不再强制同步到系统默认值，允许用户设置任意值（包括低于默认值）
                     
                     # 如果数量或价格发生变化，更新（可能是部分平仓或加仓）
                     if position.entry_quantity != entry_quantity or position.entry_price != entry_price:
@@ -1108,6 +1149,8 @@ class PositionService:
                     # 强制恢复用户自定义的值（无论是否被修改，都确保使用保存的值）
                     position.trailing_exit_pct = saved_trailing_exit_pct
                     position.stop_loss_pct = saved_stop_loss_pct
+                    if saved_max_slippage_pct is not None and hasattr(position, "max_slippage_pct"):
+                        position.max_slippage_pct = saved_max_slippage_pct
                     
                     # 如果检测到被修改，记录警告
                     if was_modified:
@@ -1140,8 +1183,9 @@ class PositionService:
                         entry_quantity=entry_quantity,
                         entry_time=entry_time,
                         leverage=Decimal(str(leverage)),
-                        trailing_exit_pct=Decimal(str(self.settings.trailing_exit_pct)),
-                        stop_loss_pct=Decimal(str(self.settings.stop_loss_pct)),
+                        trailing_exit_pct=default_trailing_pct,
+                        stop_loss_pct=default_stop_loss_pct,
+                        max_slippage_pct=Decimal(str(current_settings.max_slippage_pct)),
                         highest_price=initial_high_low,  # 初始最高价设为当前标记价格（从此刻开始追踪）
                         lowest_price=initial_high_low,  # 初始最低价设为当前标记价格（从此刻开始追踪）
                         last_check_time=datetime.now(timezone.utc),
@@ -1177,22 +1221,23 @@ class PositionService:
                                 .limit(1)
                             )
                             if recent_close_log:
+                                # 有系统关闭记录，说明是系统关闭的，无论原因是什么
                                 # 从执行日志的payload中获取退出原因
                                 payload = recent_close_log.payload or {}
                                 system_reason = payload.get("reason", "")
-                                if system_reason in ["stop_loss", "trailing_stop"]:
-                                    is_system_closed = True
-                                    logger.info("检测到持仓 {} {} 已被系统关闭（原因: {}），同步时保持系统退出原因", 
-                                              position.symbol, position.side, system_reason)
-                                    # 更新持仓状态，但保留系统设置的退出原因
-                                    position.status = PositionStatus.CLOSED
-                                    if not position.exit_time:
-                                        position.exit_time = recent_close_log.created_at
-                                    if not position.exit_reason:
-                                        position.exit_reason = system_reason
-                                    if not position.exit_price and recent_close_log.price:
-                                        position.exit_price = Decimal(str(recent_close_log.price))
-                                    closed_count += 1
+                                # 如果存在 position_closed 记录，说明是系统关闭的，无论原因是什么
+                                is_system_closed = True
+                                logger.info("检测到持仓 {} {} 已被系统关闭（原因: {}），同步时保持系统退出原因", 
+                                          position.symbol, position.side, system_reason)
+                                # 更新持仓状态，但保留系统设置的退出原因
+                                position.status = PositionStatus.CLOSED
+                                if not position.exit_time:
+                                    position.exit_time = recent_close_log.created_at
+                                if not position.exit_reason:
+                                    position.exit_reason = system_reason
+                                if not position.exit_price and recent_close_log.price:
+                                    position.exit_price = Decimal(str(recent_close_log.price))
+                                closed_count += 1
                         except Exception as exc:
                             logger.debug("检查系统关闭记录失败: {}，继续二次确认流程", exc)
                         
